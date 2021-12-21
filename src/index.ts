@@ -91,10 +91,15 @@
     const resolver = new Resolver({
       ...getRchainResolver(),
     })
-    const res = await resolver.resolve("did:rchain:5tz91pxmj1tn83faq356x9ey17y59gijuk646fowp8bc5kaama7k78/publisher");
+    try {
+      const res = await resolver.resolve("did:rchain:5tz91pxmj1tn83faq356x9ey17y59gijuk646fowp8bc5kaama7k78/publisher");
 
-    console.info(res);
+      console.info(res);
     return res;
+    } catch (e) {
+      console.error(e);
+      return e;
+    }
   }
 
   didTest().then((res) => {

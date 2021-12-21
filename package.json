@@ -1,0 +1,87 @@
+{
+  "name": "rpub-exe",
+  "version": "0.0.1",
+  "description": "RChain remote file system with fuse",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "build": "rm -rf pkg && pika build ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/r-publishing/rchain-fuse-js.git"
+  },
+  "author": "Theo",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/r-publishing/rchain-fuse-js/issues"
+  },
+  "homepage": "https://github.com/r-publishing/rchain-fuse-js#readme",
+  "bin": "dist-node/index.js",
+  "dependencies": {
+    "@vercel/ncc": "^0.32.0",
+    "bindings": "^1.5.0",
+    "chalk": "^3.0.0",
+    "did-resolver": "^2.2.0",
+    "dids": "*",
+    "fuse-native": "^2.2.6",
+    "fuse-shared-library": "^1.0.2",
+    "key-did-resolver": "^0.2.4",
+    "nanoresource": "^1.3.0",
+    "node-fuse-bindings": "^2.12.4",
+    "rchain-did-resolver": "*",
+    "rchain-token": "*",
+    "rchain-toolkit": "*"
+  },
+  "engines": {
+    "node": "16.x"
+  },
+  "devDependencies": {
+    "@pika/pack": "^0.5.0",
+    "@pika/plugin-build-node": "^0.8.1",
+    "@pika/plugin-copy-assets": "^0.8.1",
+    "@pika/plugin-standard-pkg": "^0.8.1",
+    "@pika/plugin-ts-standard-pkg": "^0.9.2",
+    "pika-plugin-pkg-node": "*",
+    "typescript": "^4.5.2"
+  },
+  "@pika/pack": {
+    "pipeline": [
+      [
+        "@pika/plugin-standard-pkg"
+      ],
+      [
+        "@pika/plugin-ts-standard-pkg",
+        {
+          "tsconfig": "tsconfig.pika.json"
+        }
+      ],
+      [
+        "@pika/plugin-build-node"
+      ],
+      [
+        "@pika/plugin-copy-assets",
+        {
+          "assets": [
+            "node_modules/fuse-native/build/Release/*"
+          ]
+        }
+      ],
+      [
+        "pika-plugin-pkg-node",
+        {
+          "name": "rdrive",
+          "targets": [
+            "node16-linux-x64",
+            "node16-macos-x64",
+            "node16-win-x64"
+          ],
+          "assets": [
+            "assets/**/*",
+            "node_modules/fuse-native/build/Release/*"
+          ]
+        }
+      ]
+    ]
+  }
+}

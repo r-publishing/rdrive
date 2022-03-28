@@ -1,0 +1,7 @@
+{
+    "events": {
+      "restart": "node --experimental-specifier-resolution=node ./dist/index.js --clean",
+      "crash": "node --experimental-specifier-resolution=node ./dist/index.js --clean",
+      "exit": "node --experimental-specifier-resolution=node ./dist/index.js --clean"
+    }
+}

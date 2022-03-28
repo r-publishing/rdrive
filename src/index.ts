@@ -43,6 +43,8 @@ import { constants } from 'fs';
 const require = createRequire(import.meta.url);
 
 const {
+  masterTerm,
+  deployTerm,
   readPursesTerm,
   readBoxTerm,
   readPursesDataTerm,
@@ -430,6 +432,7 @@ const optionDefinitions = [
   { name: 'valodatorHost', alias: 'v', type: String, multiple: true},
   { name: 'command', type: String, multiple: false, defaultOption: true },
   { name: 'privKey', alias: 'p', type: String, multiple: false },
+  { name: 'boxName', alias: 'b', type: String, multiple: false },
   { name: 'mnt', alias: 'm', type: String, multiple: false }
 ]
 
@@ -515,9 +518,10 @@ const bulkDeploy = async function (tag: Deploy, payload: any, revert?: () => any
 const options = commandLineArgs(optionDefinitions)
 console.info(options);
 
-const masterRegistryUri = options.masterRegUri;
+let masterRegistryUri = options.masterRegUri;
 const privateKey = options.privKey;
 const mntPath = options.mnt;
+const defaultBoxName = options.boxName;
 
 const pubKey = rchainToolkit.utils.publicKeyFromPrivateKey(privateKey);
 
@@ -1189,32 +1193,90 @@ else if (options.down) {
 }
 */
 
-if (options.run) {
-  console.info("With --run");
-  fuse2 = new Fuse(mntPath, ops, { displayFolder: "RDrive", mkdir: true, debug: false });
-  let deployBundlerInterval = setInterval(deployBundler, 20000);
-
-  service.run (function () {
-    fuse2?.unmount( () => {
-      logStream.write("Unmounted" + "\n");
-      //TODO: Wait until all deploys are sent
-      setTimeout(() => {
-        clearInterval(deployBundlerInterval);
-        service.stop(0);
-      }, 2000);
+const runFunction = async function () {
+  if (!masterRegistryUri) {
+    console.info("No master registry uri, creating a new one");
+    const term = masterTerm({
+      depth: 3,
+      contractDepth: 2,
     });
-  });
 
-
+    const dataAtNameResponse = await rchainToolkit.http.easyDeploy(
+      VALIDATOR_HOST,
+      term,
+      privateKey,
+      1,
+      10000000,
+      10 * 60 * 1000
+    );
   
-  logStream.write("Running service" + "\n");
-  fuse2.mount(function (err: any) {
-    logStream.write("Mounted" + "\n");
-  })
+    const data = rchainToolkit.utils.rhoValToJs(
+      JSON.parse(dataAtNameResponse).exprs[0].expr
+    );
   
+    masterRegistryUri = data.registryUri.replace('rho:id:', '');
+    console.info("Master Registry URI: %s", masterRegistryUri);
 
-  process.on('SIGINT', () => {
-      console.info("Unmounting...");
+    //Deploy box
+    const term2 = deployBoxTerm({
+      masterRegistryUri: masterRegistryUri,
+      boxId: defaultBoxName,
+      publicKey: pubKey,
+      revAddress: rchainToolkit.utils.revAddressFromPublicKey(pubKey),
+    });
+
+    const dataAtNameResponse2 = await rchainToolkit.http.easyDeploy(
+      VALIDATOR_HOST,
+      term2,
+      privateKey,
+      1,
+      10000000,
+      10 * 60 * 1000
+    );
+  
+    const data2 = rchainToolkit.utils.rhoValToJs(
+      JSON.parse(dataAtNameResponse2).exprs[0].expr
+    );
+  
+    if (data2.status !== 'completed') {
+      console.info("Unable to create box.");
+      return;
+    }
+
+    //Deploy default contract
+    const term3 = deployTerm({
+      masterRegistryUri,
+      boxId: defaultBoxName,
+      fungible: false,
+      contractId: contractName,
+      expires: undefined
+    });
+
+    const dataAtNameResponse3 = await rchainToolkit.http.easyDeploy(
+      VALIDATOR_HOST,
+      term3,
+      privateKey,
+      1,
+      10000000,
+      10 * 60 * 1000
+    );
+  
+    const data3 = rchainToolkit.utils.rhoValToJs(
+      JSON.parse(dataAtNameResponse3).exprs[0].expr
+    );
+  
+    if (data3.status !== 'completed') {
+      console.info("Unable to deploy contract.");
+      return;
+    }
+  }
+
+  if (options.run) {
+    console.info("With --run");
+    fuse2 = new Fuse(mntPath, ops, { displayFolder: "RDrive", mkdir: true, debug: false });
+    let deployBundlerInterval = setInterval(deployBundler, 20000);
+
+    service.run (function () {
       fuse2?.unmount( () => {
         logStream.write("Unmounted" + "\n");
         //TODO: Wait until all deploys are sent
@@ -1222,18 +1284,41 @@ if (options.run) {
           clearInterval(deployBundlerInterval);
           service.stop(0);
         }, 2000);
-        process.exit(0);
       });
-  });
-}
-else if (options.clean) {
-  if (fuse2) {
-    console.info("Unmounting2...")
-    fuse2.unmount( () => {
-      logStream.write("Unmounted" + "\n");
+    });
+
+
+    
+    logStream.write("Running service" + "\n");
+    fuse2.mount(function (err: any) {
+      logStream.write("Mounted" + "\n");
+    })
+    
+
+    process.on('SIGINT', () => {
+        console.info("Unmounting...");
+        fuse2?.unmount( () => {
+          logStream.write("Unmounted" + "\n");
+          //TODO: Wait until all deploys are sent
+          setTimeout(() => {
+            clearInterval(deployBundlerInterval);
+            service.stop(0);
+          }, 2000);
+          process.exit(0);
+        });
     });
   }
+  else if (options.clean) {
+    if (fuse2) {
+      console.info("Unmounting2...")
+      fuse2.unmount( () => {
+        logStream.write("Unmounted" + "\n");
+      });
+    }
+  }
+  else {
+    console.info("Usage: rdrive-service up|down");
+  }
 }
-else {
-  console.info("Usage: rdrive-service up|down");
-}
+
+runFunction();

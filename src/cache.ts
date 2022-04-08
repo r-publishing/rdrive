@@ -46,6 +46,7 @@ export interface Node {
   content?: Buffer; // used to store file contents or symlink targets
   owner?: string; // owner of node
   edit_time?: number; // last time node was edited, used for cache invalidation
+  isFinalized?: boolean; // If node exists within a finalized block
 }
 
 export type IFsStats = {
@@ -288,7 +289,8 @@ export const getFsStats = (): IFsStats => FsStats;
 
 export const updateNodeContent = (
   node: Node,
-  content: Buffer | string
+  content: Buffer | string,
+  updateBlocks: boolean = false
 ): number => {
   if (!content) {
     content = Buffer.alloc(0);
@@ -297,12 +299,14 @@ export const updateNodeContent = (
   }
   node.edit_time = Date.now();
   node.content = content;
-  node.stat.size = node.content.length;
-  const blocks_before = node.stat.blocks;
-  node.stat.blocks = Math.ceil(node.stat.size / node.stat.blksize);
-  if (blocks_before !== node.stat.blocks) {
-    if (adjustBlocksUsed(node.stat.blocks - blocks_before) < 1) {
-      return Fuse.ENOSPC;
+  if (updateBlocks) {
+    node.stat.size = node.content.length;
+    const blocks_before = node.stat.blocks;
+    node.stat.blocks = Math.ceil(node.stat.size / node.stat.blksize);
+    if (blocks_before !== node.stat.blocks) {
+      if (adjustBlocksUsed(node.stat.blocks - blocks_before) < 1) {
+        return Fuse.ENOSPC;
+      }
     }
   }
   return 0;

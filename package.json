@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "start": "nodemon -e ts --exec \"npm run watch\"",
-    "watch": "tsc  -b --verbose && node --experimental-specifier-resolution=node ./dist/index.js --run --masterRegUri gy59yfp5fy41e1fcx5s73xydfs1s7ki4shk8z7tu9docy5yupz7ku8 --privKey 6428f75c09db8b3a260fc1dcb1c93619bd3eecf6787b003ddc6ba5e87025c177 --readOnlyHost http://127.0.0.1:40403 --mnt /home/theoxd/demo/rdrive",
+    "watch": "tsc  -b --verbose && node --experimental-specifier-resolution=node ./dist/index.js --run --boxName theo --masterRegUri qcbdxbwmk89kpmsa9iy6hnfj89pgm7y1q9ufonnut5ad66m9ae381q --privKey 6428f75c09db8b3a260fc1dcb1c93619bd3eecf6787b003ddc6ba5e87025c177 --readOnlyHost http://127.0.0.1:40403 --mnt /home/theoxd/demo/rdrive",
     "compile": "tsc  -b --verbose",
     "build": "rm -rf pkg && pika build . && cd pkg && pkg . --out-path dist"
   },
@@ -32,13 +32,16 @@
     "fuse-native": "^2.2.6",
     "fuse-shared-library": "^1.0.2",
     "key-did-resolver": "^0.2.4",
+    "lodash": "^4.17.21",
+    "lodash.clonedeep": "^4.5.0",
     "nanoresource": "^1.3.0",
     "node-fuse-bindings": "^2.12.4",
     "os-service": "^2.2.0",
     "queued-jobs": "^1.1.0",
     "rchain-did-resolver": "*",
     "rchain-token": "*",
-    "rchain-toolkit": "^0.3.5"
+    "rchain-toolkit": "^0.3.5",
+    "workerpool": "^6.2.0"
   },
   "engines": {
     "node": "16.x"

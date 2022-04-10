@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "start": "nodemon -e ts --exec \"npm run watch\"",
-    "watch": "tsc  -b --verbose && node --experimental-specifier-resolution=node ./dist/index.js --run --boxName theo --masterRegUri qcbdxbwmk89kpmsa9iy6hnfj89pgm7y1q9ufonnut5ad66m9ae381q --privKey 6428f75c09db8b3a260fc1dcb1c93619bd3eecf6787b003ddc6ba5e87025c177 --readOnlyHost http://127.0.0.1:40403 --mnt /home/theoxd/demo/rdrive",
+    "watch": "tsc  -b --verbose && node --experimental-specifier-resolution=node ./dist/index.js --run --contractName mynft --boxName theo --privKey 6428f75c09db8b3a260fc1dcb1c93619bd3eecf6787b003ddc6ba5e87025c177 --readOnlyHost http://127.0.0.1:40403 --validatorHost http://127.0.0.1:40403 --mnt /home/theoxd/demo/rdrive",
     "compile": "tsc  -b --verbose",
     "build": "rm -rf pkg && pika build . && cd pkg && pkg . --out-path dist"
   },

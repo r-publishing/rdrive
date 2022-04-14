@@ -7,6 +7,7 @@
 
 import fs from "fs";
 import { URL } from "url";
+import util from "util";
 import process from "process";
 
 import path from 'path';
@@ -62,7 +63,8 @@ const {
   updatePursePriceTerm,
   withdrawTerm,
   creditTerm,
-  swapTerm
+  swapTerm,
+  creditAndSwapTerm
 } = require("rchain-token");
 
 const service = require("os-service");
@@ -91,7 +93,8 @@ enum Deploy {
   UPDATE_PURSE_DATA,
   UPDATE_PURSE_PRICE,
   WITHDRAW,
-  SWAP
+  SWAP,
+  CREDIT_AND_SWAP
 }
 
 
@@ -124,7 +127,8 @@ const deployTermGenerators = new Map<Deploy, TermGeneratorFunction>([
   [Deploy.UPDATE_PURSE_DATA, updatePurseDataTerm],
   [Deploy.UPDATE_PURSE_PRICE, updatePursePriceTerm],
   [Deploy.WITHDRAW, withdrawTerm],
-  [Deploy.SWAP, swapTerm]
+  [Deploy.SWAP, swapTerm],
+  [Deploy.CREDIT_AND_SWAP, creditAndSwapTerm]
 ]);
 
 //const messageFileURL = new URL("../assets/message.json", import.meta.url);
@@ -237,11 +241,15 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
         let combinedSuccessMap2 = new Array<() => any>();
         let combinedRevertsMap2 = new Array<() => any>();
 
-        for (var i = queueLength - 1; i >= 0; i--) {
+        let chunksTotal = 0;
+        for (var i = 0; i < queueLength; i++) {
           const data = queue.at(i);
           
-          if (Object.keys(payload.data).length > 512 ) {
-            break
+          //if (Object.keys(data.payload.data).length > 2048 ) {
+          //  break
+          //}
+          if (chunksTotal + Object.keys(data.payload.data).length > 2048) {
+            break;
           }
 
           payload.purses = {...payload.purses, ...data.payload.purses};
@@ -251,12 +259,14 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           combinedRevertsMap.push(data.revert);
 
           deploys.set(deployType.toString() + data.id, data);
+          chunksTotal += Object.keys(data.payload.data).length;
         }
+
+        let bundled = [];
 
         if (deployBundle.has(Deploy.UPDATE_PURSE_DATA)) {
           const dataQueue = deployBundle.get(Deploy.UPDATE_PURSE_DATA);
-          for (var i = dataQueue.length - 1; i >= 0; i--) {
-            
+          for (var i = 0; i < dataQueue.length; i++) {
             const dataDeploy = dataQueue.at(i);
 
             const chunkId = dataDeploy.payload.pos / 4096;
@@ -266,7 +276,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
             }
 
             //deploy would be too large
-            if (payload.data[dataDeploy.payload.purseId] && Object.keys(payload.data[dataDeploy.payload.purseId]).length > 4096 ) {
+            if (payload.data[dataDeploy.payload.purseId] && Object.keys(payload.data[dataDeploy.payload.purseId]).length > 2048 ) {
               break
             }
 
@@ -277,6 +287,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
 
             deploys.set(Deploy.UPDATE_PURSE_DATA.toString() + dataDeploy.id, dataDeploy);
             deployBundle.set(Deploy.UPDATE_PURSE_DATA, dataQueue.filter( el => el.id !== dataDeploy.id));
+            bundled.push(chunkId);
           }
         }
         /*
@@ -395,7 +406,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
                 const chunkId = data.payload.pos / 4096;
 
                 //deploy would be too large
-                if (Object.keys(payload3.data).length > 512 ) {
+                if (Object.keys(payload3.data).length > 2048 ) {
                   break
                 }
 
@@ -414,7 +425,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
               payload3.data = JSON.stringify(payload3.data);
               const termGenerator = deployTermGenerators.get(deployType);
 
-              console.info("Deploying Chunks: ");
+              console.info("Deploying Chunks for purse " + purseId + ": ");
               console.info(processedChunks);
               
               reverts.get(deployType).push(() => {
@@ -438,7 +449,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
       //    continue
       default:
         for (var i = queueLength - 1; i >= 0; i--) {
-          const data = queue.pop();
+          const data = queue.at(i);
           if (deploys.has(Deploy.UPDATE_PURSE_DATA.toString() + data.id)) {
             //Already processed
             continue;
@@ -455,11 +466,12 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
               termGenerator: termGenerator,
               payload: data.payload
             }));
+            queue.pop();
           }
           catch (err) {
             console.info(err);
             //TODO: retry?
-            queue.push(data);
+            //queue.push(data);
           }
         }
 
@@ -482,6 +494,11 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
 
   ret.forEach((deployRet, i) => {
     const deployType = findDeployTypeById[i];
+
+    if (!deployType) {
+      return;
+    }
+
     const data = rchainToolkit.utils.rhoValToJs(
       JSON.parse(deployRet).exprs[0].expr
     );
@@ -551,7 +568,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           //deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          //reverts.get(deployType).at(i)();
         }
 
         return ret;
@@ -587,12 +604,24 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          //reverts.get(deployType).at(i)();
         }
 
         return ret;
+        case Deploy.CREDIT_AND_SWAP:
+
+          if (data.status === 'completed') {
+            console.info("credited and swapped");
+            //successMap.get(deployType).at(i)();
+            deployBundle.delete(deployType);
+          }
+          else {
+            reverts.get(deployType).at(i)();
+          }
+  
+          return ret;
       default:
-        console.info("unknown deploy deployType");
+        console.info("unknown deploy deployType ", deployType);
     }
   })
 
@@ -646,6 +675,7 @@ for (let i = 0; i < 1000; i++) { //
   writeBundleQueue.registerHandler(async (data: BundledDeployType) => {
     console.info("................................");
     const term = data.termGenerator(data.payload);
+
     const ret = await rchainToolkit.http.easyDeploy(
       validatorArray[i % numberOfValidators],
       term,
@@ -675,7 +705,7 @@ const ops = {
     setPathNode("", rootNode);
     setPathNode(pathSep, rootNode);
 
-    //mkFile(pathSep, "token.conf", "{\n price: 0\n}\n");
+    mkFile(pathSep, "token.conf", "{\n \"price\": 0\n}\n");
 
     const result = await bulkExploreDeploy(ExploreDeploy.READ_BOXES, { masterRegistryUri: masterRegistryUri});
     const boxesResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
@@ -745,25 +775,39 @@ const ops = {
           console.info(pursesInfo);
 
           purses.forEach((purse: string) => {
+            const purseInfo = pursesInfo[purse];
             const node = getPathNode(pathSep + boxName + pathSep + purse);
 
             if (!node) {
               const fileNode = mkFile(pathSep + boxName, purse, "");
               fileNode.isFinalized = true;
 
-              const purseInfo = pursesInfo[purse];
               const nOfChunks = purseInfo.chunks  || 1;
               const prevBlocksSize = fileNode.stat.blocks;
-              fileNode.stat.blocks = nOfChunks;
               fileNode.stat.size = nOfChunks * 4096;
+
+              fileNode.stat.blksize = 512; //For some reason necessary for Fuse to report correct file size.
+              fileNode.stat.blocks = nOfChunks * 8; //How many blocks it would have been if they were of size 512
               
-              fileNode.content = Buffer.alloc(fileNode.stat.size);
+              //fileNode.content = Buffer.alloc(fileNode.stat.size);
               if (prevBlocksSize !== fileNode.stat.blocks) {
                 adjustBlocksUsed(fileNode.stat.blocks - prevBlocksSize);
               }
               console.info(fileNode.stat);
 
               const f = mkFd(fileNode);
+            }
+
+            if (purseInfo && purseInfo.hasOwnProperty("price") && purseInfo.price) {
+              
+              const node2 = getPathNode(pathSep + boxName + pathSep + "." + purse + "." + contractName);
+              if (!node2) {
+                const fileConfigNode = mkFile(pathSep + boxName, "." + purse + "." + contractName, `{\n price: ${purseInfo.price[1]}\n}\n`);
+                mkFd(fileConfigNode);
+              }
+              else {
+                updateNodeContent(node2, `{\n \"price\": ${purseInfo.price[1]}\n}\n`);
+              }
             }
           });
         }
@@ -807,6 +851,13 @@ const ops = {
       return process.nextTick(cb, Fuse.EACCES);
     }
 
+    const contractConfigFileNode = getPathNode(pathSep + "token.conf");
+    let price = 0;
+    if (contractConfigFileNode && contractConfigFileNode.content) {
+      const config = JSON.parse(contractConfigFileNode.content.toString());
+      price = parseInt(config.price);
+    }
+
     const extension = path.extname(name);
     if (!isHiddenFile && extension !== ".rev") {
       const payload = {
@@ -815,14 +866,19 @@ const ops = {
         purses: {
           [name]: {
             id: name,
-            price: null,
+            price: `("rev", ${price})`,
             boxId: boxId,
-            quantity: 1
+            quantity: 1,
           },
         },
         data: {} 
       }
 
+      let fileConfigNode = getPathNode(inPath);
+      if (!fileConfigNode) {
+        const fileConfigNode = mkFile(p.join(pathSep), "." + name + "." + contractName, "{\n \"price\": " + price + "\n}\n", mode);
+        mkFd(fileConfigNode);
+      }
 
       bulkDeploy(Deploy.CREATE_PURSES, payload, () => {
         //Revert on failure
@@ -891,7 +947,10 @@ const ops = {
     const boxName = inPath.split("/")[1];
 
     const purseName = path.basename(inPath);
+    const extension = path.extname(purseName);
     const node = getPathNode(inPath);
+    const isSpecialFile = extension === ".rev" || purseName.startsWith(".");
+
     if (!node) {
       return process.nextTick(cb, Fuse.EBADF);
       /*
@@ -910,71 +969,78 @@ const ops = {
       */
     }
 
-    const chunksToRead = [...Array(chunksLength).keys()].map(i => i + chunkStart).filter(i => i < node.stat.blocks);
+    //if (!node.content) {
+    //  console.info("Has content");
+    //  return process.nextTick(cb, 0);
+    //}
+    if (node.content) {
+      const str = node.content.slice(pos, pos + len);
+      if (str.length == 0 && !isSpecialFile) {
 
-    if (inPath.split("/").length > 2 && chunksToRead.length > 0) {
-      const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES_DATA, {
-        masterRegistryUri: masterRegistryUri,
-        pursesIds: [purseName],
-        contractId: contractName,
-        chunks: {
-          [purseName] : chunksToRead
+        const chunksToRead = [...Array(chunksLength).keys()].map(i => i + chunkStart).filter(i => i < node.stat.blocks);
+
+        if (inPath.split("/").length > 2 && chunksToRead.length > 0 && !isSpecialFile) {
+          const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES_DATA, {
+            masterRegistryUri: masterRegistryUri,
+            pursesIds: [purseName],
+            contractId: contractName,
+            chunks: {
+              [purseName] : chunksToRead
+            }
+          });
+    
+          console.info("reading chunks: ");
+          console.info(chunksToRead );
+          const parsedResult = JSON.parse(result);
+    
+          if (parsedResult.expr.length == 0) {
+            return process.nextTick(cb, 0);
+          }
+          
+          const retData = rchainToolkit.utils.rhoValToJs(parsedResult.expr[0]);
+    
+          if (retData[purseName]) {
+            /*
+            let totalLength = 0;
+    
+            Object.keys(retData[purseName]).forEach((chunkId: string) => {
+              const data = retData[purseName][chunkId];
+              const chunkContent = Buffer.from(data, 'base64url');
+              totalLength += chunkContent.length;
+            });
+            */
+    
+            var b = Buffer.alloc(len);
+            Object.keys(retData[purseName]).forEach((chunkId: string) => {
+              const data = retData[purseName][chunkId];
+              const dataAsStr = Buffer.from(data, "base64url");
+              const chunkb = Buffer.from(data.toString("utf8"), 'base64url');
+              chunkb.copy(b, (parseInt(chunkId) - chunkStart) * 4096, 0, dataAsStr.length);
+            });
+    
+            const chunkData = b.slice(0, len);
+            const str = Buffer.concat([
+              node.content.slice(0, pos),
+              chunkData
+            ]);
+            chunkData.copy(buf);
+    
+            const ret = updateNodeContent(node, str);
+    
+            return process.nextTick(cb, ret < 0 ? ret : len);
+          }
         }
-      });
 
-      console.info("reading chunks: ");
-      console.info(chunksToRead );
-      const parsedResult = JSON.parse(result);
 
-      if (parsedResult.expr.length == 0) {
         return process.nextTick(cb, 0);
       }
-      
-      const retData = rchainToolkit.utils.rhoValToJs(parsedResult.expr[0]);
 
-      if (retData[purseName]) {
-        /*
-        let totalLength = 0;
-
-        Object.keys(retData[purseName]).forEach((chunkId: string) => {
-          const data = retData[purseName][chunkId];
-          const chunkContent = Buffer.from(data, 'base64url');
-          totalLength += chunkContent.length;
-        });
-        */
-
-        var b = Buffer.alloc(len);
-        Object.keys(retData[purseName]).forEach((chunkId: string) => {
-          const data = retData[purseName][chunkId];
-          const dataAsStr = Buffer.from(data, "base64url");
-          const chunkb = Buffer.from(data.toString("utf8"), 'base64url');
-          chunkb.copy(b, (parseInt(chunkId) - chunkStart) * 4096, 0, dataAsStr.length);
-        });
-
-        const chunkData = b.slice(0, len);
-        const str = Buffer.concat([
-          node.content.slice(0, pos),
-          chunkData
-        ]);
-        chunkData.copy(buf);
-
-        const ret = updateNodeContent(node, str);
-
-        return process.nextTick(cb, ret < 0 ? ret : len);
-
+      else {
+        str.copy(buf);
+        return process.nextTick(cb, str.length);
       }
     }
 
-    if (!node.content) {
-      return process.nextTick(cb, 0);
-    }
-    const str = node.content.slice(pos, pos + len);
-    if (!str) {
-      return process.nextTick(cb, 0);
-    }
-
-    str.copy(buf);
-    return process.nextTick(cb, str.length);
   },
   truncate: async function (inPath: string, size: any, cb: FuseCallback) {
     const node = getPathNode(inPath);
@@ -1010,6 +1076,11 @@ const ops = {
     return process.nextTick(cb, 0);
   },
   unlink: async function (inPath: string, cb: FuseCallback) {
+    const fileName = path.basename(inPath);
+    const extension = path.extname(fileName);
+    const isHiddenFile = fileName.startsWith(".");
+    const isSpecialFile = extension === ".rev" || extension === "."+contractName;
+
     if (inPath === "." || inPath === "..") {
       return process.nextTick(cb, Fuse.EINVAL);
     }
@@ -1018,14 +1089,16 @@ const ops = {
       return process.nextTick(cb, Fuse.ENOENT);
     }
 
-    const boxName = inPath.split("/")[1];
-    const purseName = path.basename(inPath);
-    let payload = {
-      masterRegistryUri: masterRegistryUri,
-      contractId: contractName,
-      purseId: purseName,
-    };
-    bulkDeploy(Deploy.DELETE_PURSE, payload);
+    if (!isHiddenFile && !isSpecialFile) {
+      const boxName = inPath.split("/")[1];
+      const purseName = path.basename(inPath);
+      let payload = {
+        masterRegistryUri: masterRegistryUri,
+        contractId: contractName,
+        purseId: purseName,
+      };
+      bulkDeploy(Deploy.DELETE_PURSE, payload);
+    }
 
     const parentPath = getPathFromName(inPath);
     const parentNode = getPathNode(parentPath);
@@ -1060,8 +1133,10 @@ const ops = {
       content = Buffer.from(buf.slice(0, length));
     }
 
+    const ret = updateNodeContent(node, content);
+
     const boxNode = getPathNode(pathSep + boxName);
-    if (boxNode && !boxNode.owner) {
+    if (boxNode && !boxNode.owner && isDirectory(boxNode.stat.mode)) {
       const result = await bulkExploreDeploy(ExploreDeploy.READ_BOX, { masterRegistryUri: masterRegistryUri, boxId: boxName});
       const boxResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
 
@@ -1120,7 +1195,7 @@ const ops = {
               masterRegistryUri: masterRegistryUri,
               boxId: boxName
             }
-            bulkDeploy(Deploy.CREDIT, payload);
+            bulkDeploy(Deploy.CREDIT, payload, () => {}, boxName, () => {});
           }
           if (topUp < 0) {
             //Do withdraw
@@ -1134,7 +1209,7 @@ const ops = {
               contractId: "rev",
               merge: false,
             };
-            bulkDeploy(Deploy.WITHDRAW, payload);
+            bulkDeploy(Deploy.WITHDRAW, payload, () => {}, boxName, () => {});
           }
         }
 
@@ -1150,49 +1225,48 @@ const ops = {
           pos: pos,
         };
 
-        try {
+        //try {
           bulkDeploy(Deploy.UPDATE_PURSE_DATA, payload, () => {}, purseName+"@"+boxName, () => {
-            node.isFinalized = true;
-
-            const nOfBlocks = Math.ceil(length / 4096);
-            const prevBlocksSize = node.stat.blocks;
-            node.stat.size += length;
-            node.stat.blocks += nOfBlocks;
-
-            if (prevBlocksSize !== node.stat.blocks) {
-              adjustBlocksUsed(node.stat.blocks - prevBlocksSize);
-            }
+            //node.isFinalized = true;
           });
 
           //console.info("File saved!");
-          cb(length)
-        } catch (err) {
-          console.log(err);
-          cb(0);
-        }
       }
     }
     else {
         //Update purse config
         console.info("Update purse config");
-        const conf = JSON.parse(content.toString());
-        const purseId = purseName.slice(0, -(contractName.length+1)).substring(1);
-        let price = null;
+        if (content) {
+          const conf = JSON.parse(content.toString());
+          const purseId = purseName.slice(0, -(contractName.length+1)).substring(1);
+          let price = null;
 
-        if (conf.price) {
-          price = conf.price;
+          if (conf.price) {
+            price = conf.price;
+          }
+          const payload = {
+            masterRegistryUri: masterRegistryUri,
+            purseId: purseId,
+            boxId: boxName,
+            contractId: contractName,
+            price: `"rev", ${price}`,
+          };
+          bulkDeploy(Deploy.UPDATE_PURSE_PRICE, payload, () => {}, purseId, () => {
+          });
         }
-        const payload = {
-          masterRegistryUri: masterRegistryUri,
-          purseId: purseId,
-          boxId: boxName,
-          contractId: contractName,
-          price: `"rev", ${price}`,
-        };
-        bulkDeploy(Deploy.UPDATE_PURSE_PRICE, payload, () => {}, purseId);
     }
-
-    const ret = updateNodeContent(node, content);
+    
+    
+    const nOfBlocks = Math.ceil(length / 4096);
+    const prevBlocksSize = node.stat.blocks;
+    node.stat.size += length;
+    node.stat.blocks += nOfBlocks * 8;
+    node.stat.blksize = 512;
+    
+    if (prevBlocksSize !== node.stat.blocks) {
+      adjustBlocksUsed(node.stat.blocks - prevBlocksSize);
+    }
+    
   
     return process.nextTick(cb, ret < 0 ? ret : length);
   },
@@ -1238,7 +1312,7 @@ const ops = {
               data: '',
               newId: dstPurseName,
             }
-            bulkDeploy(Deploy.SWAP, payload);
+            bulkDeploy(Deploy.SWAP, payload, () => {}, purseName, () => {});
 
         } else {
             let quantity = 1;
@@ -1339,12 +1413,13 @@ const ops = {
     let node: Node | null = null;
     const p = inPath.split(pathSep);
     const name = p.pop();
+    const isHiddenFile = name.startsWith(".");
     
     if (p.length > 1) {
       return process.nextTick(cb, Fuse.ENOENT);
     }
 
-    if (!name) {
+    if (!name || isHiddenFile) {
       return process.nextTick(cb, Fuse.ENOENT);
     }
     if (name.length > getFsStats().max_name_length) {
@@ -1359,7 +1434,7 @@ const ops = {
     }
 
     try {
-      bulkDeploy(Deploy.DEPLOY_BOX, payload);
+      bulkDeploy(Deploy.DEPLOY_BOX, payload, () => {}, name, () => {});
     } catch (err) {
       console.log(err);
       return process.nextTick(cb, Fuse.ENOENT);

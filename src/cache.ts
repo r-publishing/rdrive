@@ -122,7 +122,6 @@ const fd2Node = new Map<number, Node>();
  * @returns file descriptor or -1 if one was not free
  */
  export const mkFd = (node: Node): number => {
-  console.info("mkFd");
   let f;
   let i = FsStats.max_fds; // max attempts to find free file descriptor
   do {
@@ -138,7 +137,6 @@ const fd2Node = new Map<number, Node>();
     return Fuse.EMFILE;
   }
   // assign the node to the file descriptor
-  console.info("fd2Node.set ", f);
   fd2Node.set(f, node);
   // return the file descriptor
   return f;

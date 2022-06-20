@@ -1,5 +1,5 @@
 {
-  "name": "rpub-exe",
+  "name": "rdrive",
   "version": "1.0.0",
   "description": "RDrive, an RChain powered remote file system with fuse",
   "private": true,

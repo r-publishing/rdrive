@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/r-publishing/rchain-fuse-js.git"
+    "url": "git+https://github.com/r-publishing/rdrive.git"
   },
   "author": "Theo Hallenius, RChain Publishing LCA",
   "license": "Apache-2.0",

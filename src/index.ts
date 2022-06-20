@@ -6,15 +6,14 @@
  */
 
 import fs from "fs";
-import { URL } from "url";
-import util from "util";
 import process from "process";
 
 import path from 'path';
 import Fuse from './fusen';
 
+import { memoryUsage } from 'node:process';
 
-import * as rchainToolkit from 'rchain-toolkit';
+import * as rchainToolkit from "@fabcotech/rchain-toolkit";
 
 import { createRequire } from 'module';
 
@@ -33,18 +32,18 @@ import {
   truncateFile,
   addNodeToParent,
   updateNodeContent,
-  changeNodeOwner,
   getPathFromName,
   getNameFromPath,
   removeNodeFromParent,
-  adjustBlocksUsed
+  adjustBlocksUsed,
+  getNodeContent
 } from "./cache";
 
 import { sep as pathSep } from 'path';
 import { constants } from 'fs';
-import workerpool from 'workerpool';
-import { result } from "lodash";
-import { dataAtName } from "rchain-toolkit/dist/http";
+
+import cliProgress from "cli-progress";
+import byteSize from "byte-size";
 
 const require = createRequire(import.meta.url);
 
@@ -53,6 +52,7 @@ const {
   deployTerm,
   readPursesTerm,
   readBoxTerm,
+  readConfigTerm,
   readPursesDataTerm,
   decodePurses,
   updatePurseDataTerm,
@@ -70,9 +70,7 @@ const {
 const service = require("os-service");
 const commandLineArgs = require('command-line-args')
 
-//process.setMaxListeners(0);
 require('events').EventEmitter.defaultMaxListeners = 20000;
- 
  
 const message_file_path = path.join(import.meta.url, '../assets/message.json');
 const fuse_node_path = path.join(import.meta.url, '../assets/fuse.node');
@@ -99,12 +97,20 @@ enum Deploy {
 
 
 type DeployType = {
-  id: string;
+  id: number;
   deployType: number;
   payload: any;
   priority: number;
   revert: () => void;
   success: () => void;
+};
+
+type ExploreDeployType = {
+  id: number;
+  deployType: number;
+  payload: any;
+  priority: number;
+  success: (ret: any) => void;
 };
 
 type BundledDeployType = {
@@ -135,16 +141,24 @@ const deployTermGenerators = new Map<Deploy, TermGeneratorFunction>([
 //const fileBuff = fs.readFileSync(messageFileURL.pathname);
 //const { value } = JSON.parse(fileBuff.toString());
 
-//const cloneDeep = require('lodash.cloneDeep');
 const QueuedJobs = require("queued-jobs").default;
-const readQueue = new QueuedJobs(40960, 2000000);
-const writeQueue = new QueuedJobs(40960, 2000000);
+const readQueue = new QueuedJobs(40960, 999 * 60 * 1000);
+const writeQueue = new QueuedJobs(40960, 999 * 60 * 1000);
 
-const readBundleQueue = new QueuedJobs(40960, 2000000);
-const writeBundleQueue = new QueuedJobs(40960, 2000000);
-const maxPhloLimit = 1000000000;
+const readBundleQueue = new QueuedJobs(40960, 999 * 60 * 1000);
+const writeBundleQueue = new QueuedJobs(40960, 999 * 60 * 1000);
+const maxPhloLimit = 10000000000;
 
-const pursesToRead = new Set();
+//Restricts the number of data chunks deployed with each deploy.
+//This is to prevent the deploy from taking too long and fit within the max deploy size.
+const maxChunks = 1024;
+const maxReadChunks = 4096;
+
+//This parameter allocates x amount of workers per validator.
+//If this number is too high validator can become overloaded and not respond untill all workers are finished.
+const nOfWorkersPerValidator = 2;
+
+//const pursesToRead = new Set();
 
 const optionDefinitions = [
   { name: 'run', alias: 'r', type: Boolean },
@@ -156,50 +170,75 @@ const optionDefinitions = [
   { name: 'privKey', alias: 'p', type: String, multiple: false },
   { name: 'boxName', alias: 'b', type: String, multiple: false },
   { name: 'contractName', alias: 'n', type: String, multiple: false },
-  { name: 'mnt', alias: 'm', type: String, multiple: false }
+  { name: 'mnt', alias: 'm', type: String, multiple: false },
+  { name: 'shardId', alias: 's', type: String, multiple: false },
+  { name: 'pursePrice', alias: 'x', type: Number, multiple: false }
 ]
 
 
 const options = commandLineArgs(optionDefinitions)
-console.info(options);
 
 let masterRegistryUri = options.masterRegUri;
+let hasBox = false;
+let hasContract = false;
+
+let pubKey = "";
 const privateKey = options.privKey;
 const mntPath = options.mnt;
 const defaultBoxName = options.boxName;
-const contractName = options.contractName;
+let contractName = options.contractName;
+const shardId = options.shardId;
+const pursePrice = options.pursePrice || 500000000;
 
+const progressBars = new Map<string, cliProgress.SingleBar>();
+const futureReadMap = new Map<string, number>();
 
 const deployQueue = new Map<number, Array<DeployType>>();
-const exploreDeployQueue = new Map<number, Array<DeployType>>();
+const exploreDeployQueue = new Map<number, Array<ExploreDeployType>>();
 
-//const deployPool = workerpool.pool();
+function formatter(options, params, payload) {
+  const bar = options.barCompleteString.substr(0, Math.round(params.progress*options.barsize)) + options.barIncompleteString.substr(0, Math.round((1-params.progress)*options.barsize));
+  return 'Uploading ' + bar + ' ' + Math.floor(params.progress * 100) + "% | " + byteSize(params.value) + '/' + byteSize(params.total) + " | " + payload.name;
+}
+
+const multibar = new cliProgress.MultiBar({
+  clearOnComplete: true,
+  hideCursor: true,
+  format: formatter
+}, cliProgress.Presets.shades_grey);
 
 
-readQueue.registerHandler(async (data: DeployType) => {
-  const termGenerator = exploreDeployTermGenerators.get(data.deployType);
-  const term = termGenerator(data.payload);
-  const result = await rchainToolkit.http.exploreDeploy(READ_ONLY_HOST, {
-    term: term
+readQueue.registerHandler(async (data: ExploreDeployType, requestId: number) => {
+  return new Promise<any>((resolve, reject) => {
+   
+    data.id = requestId;
+
+    if (!exploreDeployQueue.has(data.deployType)) {
+      exploreDeployQueue.set(data.deployType, [data]);
+    } else {
+      exploreDeployQueue.get(data.deployType).push(data);
+    }
+
+    readQueue.once(`resolve:${requestId}`, (result) => {
+      resolve(result)
+    })
   });
-  
-  return result;
 });
 
+/*
 readBundleQueue.registerHandler(async (data: DeployType) => {
   if (!pursesToRead.has(data)) {
     pursesToRead.add(data);
   }
   return data;
 });
+*/
 
-var logStream = fs.createWriteStream(process.argv[0] + ".log");
+//=================
 
-const VALIDATOR_HOST = "http://127.0.0.1:40403";
-const READ_ONLY_HOST = "http://127.0.0.1:40403";
+writeQueue.registerHandler(async (data: DeployType, requestId: number) => {
 
-
-writeQueue.registerHandler(async (data: DeployType) => {
+  data.id = requestId;
   if (!deployQueue.has(data.deployType)) {
     deployQueue.set(data.deployType, [data]);
   } else {
@@ -208,11 +247,207 @@ writeQueue.registerHandler(async (data: DeployType) => {
 })
 
 
+let validatorArray = [];
+if (options.validatorHost) {
+  validatorArray = [...options.validatorHost];
+}
+const numberOfValidators = validatorArray.length;
+
+
+let readOnlyArray = [];
+if (options.readOnlyHost) {
+  readOnlyArray = [...options.readOnlyHost];
+}
+const numberOfObservers = readOnlyArray.length;
+
+for (let i = 0; i < 1; i++) {
+  readBundleQueue.registerHandler(async (data: BundledDeployType) => {
+    const term = data.termGenerator(data.payload);
+
+    const ret = await rchainToolkit.http.exploreDeploy(readOnlyArray[i % numberOfObservers], {
+      term: term
+    }).catch(err => {
+      readBundleQueue.handle(data);
+    });
+    
+    return {data: data, ret: ret};
+  });
+}
+
+
+let writeListeners = 0;
+for (let i = 0; i < numberOfValidators * nOfWorkersPerValidator; i++) { //
+  writeBundleQueue.registerHandler(async (data: BundledDeployType) => {
+    const term = data.termGenerator(data.payload);
+
+    writeListeners += 1;
+    
+    const ret = await rchainToolkit.http.easyDeploy(
+      validatorArray[i % numberOfValidators],
+      {
+        term: term,
+        shardId: shardId,
+        privateKey: privateKey,
+        phloPrice: 'auto',
+        phloLimit: maxPhloLimit,
+        timeout: 250 * 60 * 1000
+      }
+    ).catch(err => {
+      writeBundleQueue.handle(data);
+    });
+    
+    writeListeners -= 1;
+
+    return ret;
+  });
+}
+
+var logStream = fs.createWriteStream(process.argv[0] + ".log");
+
+
+const exploreDeployBundler = async function(exploreDeployBundle: Map<number, Array<ExploreDeployType>>) {
+  const promises = [];
+  const requestIds = [];
+  const successMap = new Map<number, Array<(ret: any) => void>>();
+  let findDeployTypeById = Array<number>();
+  
+  for (const [deployType, queue] of exploreDeployBundle) {
+    findDeployTypeById.push(deployType);
+    const queueLength = queue.length;
+
+    if (!successMap.has(deployType)) {
+      successMap.set(deployType, []);
+    }
+
+    switch (deployType) {
+      /*
+      case ExploreDeploy.READ_PURSES_DATA:
+        let processedChunks = [];
+        let combinedSuccessMap = new Array<(ret: any) => void>();
+        //Group deploys by name
+        var groupedByName = queue.reduce(function(groups: Map<string, ExploreDeployType[]>, item: ExploreDeployType) {
+          const purseId = item.payload.pursesIds[0];
+
+          if (!groups.has(purseId)) {
+            groups.set(purseId, []);
+          }
+          groups.get(purseId).push(item);
+          return groups;
+        }, new Map<string, ExploreDeployType[]>());
+
+        let combinedPayload = {
+          masterRegistryUri: masterRegistryUri,
+          contractId: contractName,
+          pursesIds: [ ...groupedByName.keys()],
+          chunks: {}
+        };
+
+        for (const [purseId, queue2] of groupedByName) {
+          for (const item of queue2) {
+            //processedChunks.push(item.payload.chunks);
+            if (!combinedPayload.chunks.hasOwnProperty(purseId)) {
+              combinedPayload.chunks[purseId] = [];
+            }
+
+            combinedSuccessMap.push(item.success);
+            combinedPayload.chunks[purseId] = [...new Set([...combinedPayload.chunks[purseId], ...item.payload.chunks[purseId]])];
+          
+            const filtered = exploreDeployBundle.get(ExploreDeploy.READ_PURSES_DATA).filter( el => el.id !== item.id);
+
+            exploreDeployBundle.set(ExploreDeploy.READ_PURSES_DATA, filtered);
+          }
+        }
+
+        //TODO
+        //successMap.get(deployType).push(() => {
+        //  combinedSuccessMap.map(success => success);
+        //});
+
+        if (combinedPayload.pursesIds.length > 0) {
+          const termGenerator = exploreDeployTermGenerators.get(deployType);
+          promises.push(readBundleQueue.handle({
+            termGenerator: termGenerator,
+            payload: combinedPayload
+          }));
+
+        }
+
+        continue;
+        */
+      default:
+        for (var i = queueLength - 1; i >= 0; i--) {
+          const data = queue[i];
+
+          try {
+            const termGenerator = exploreDeployTermGenerators.get(deployType);
+            promises.push(readBundleQueue.handle({
+              ...data,
+              termGenerator: termGenerator
+            }));
+            requestIds.push(data.id);
+            queue.pop();
+          }
+          catch (err) {
+            console.info(err);
+            //TODO: retry?
+            //queue.push(data);
+          }
+          
+        }
+
+    }
+  }
+  
+  
+  let ret = [];
+  if (promises.length > 0) {
+    ret = await Promise.all(promises);
+  }
+  else {
+    return;
+  }
+
+  ret.forEach((deployRet: {data: ExploreDeployType, ret: any}, i) => {
+    const deployType = findDeployTypeById[i];
+
+    if (!deployType) {
+      return;
+    }
+    
+
+    switch (deployType) {
+      //case ExploreDeploy.READ_PURSES_DATA:
+        /*
+        if (data.status === 'completed') {
+          //console.info("Box deployed!");
+          deployBundle.delete(deployType);
+        }
+
+        return deployBundle;
+        */
+       //return ret;
+
+      default:
+        if (deployRet.data.success) {
+          deployRet.data.success(deployRet.ret);
+        }
+
+        exploreDeployBundle.delete(deployType);
+        readQueue.dispatchEvent(`resolve:${deployRet.data.id.toString()}`, deployRet.ret);
+    }
+
+    exploreDeployBundle.delete(deployType);
+  });
+
+  return exploreDeployBundle;
+}
+
+//Don't ask me how it works, it just does, ok?
 const deployBundler = async function(deployBundle: Map<number, Array<DeployType>>) {
   const promises = [];
   const reverts = new Map<number, Array<() => any>>();
   const successMap = new Map<number, Array<() => any>>();
-  const deploys = new Map<string, DeployType>();
+  const deploys = new Map<number, DeployType>();
   let findDeployTypeById = Array<number>();
 
   for (const [deployType, queue] of deployBundle) {
@@ -224,6 +459,10 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
       successMap.set(deployType, []);
     }
     const queueLength = queue.length;
+
+    if (queueLength == 0) {
+      continue;
+    }
 
     switch (deployType) {
       //Here we bundle all CREATE_PURSES deploys into one + any other deploys like UPDATE_PURSE_DATA.
@@ -243,12 +482,10 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
 
         let chunksTotal = 0;
         for (var i = 0; i < queueLength; i++) {
-          const data = queue.at(i);
+          const data = queue[i];
           
-          //if (Object.keys(data.payload.data).length > 2048 ) {
-          //  break
-          //}
-          if (chunksTotal + Object.keys(data.payload.data).length > 2048) {
+          //TODO: take maxNumberOfChunks into account
+          if (chunksTotal + Object.keys(data.payload.data).length > maxChunks) {
             break;
           }
 
@@ -258,16 +495,20 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           combinedSuccessMap.push(data.success);
           combinedRevertsMap.push(data.revert);
 
-          deploys.set(deployType.toString() + data.id, data);
+          deploys.set(data.id, data);
           chunksTotal += Object.keys(data.payload.data).length;
         }
 
-        let bundled = [];
+        if (Object.keys(payload.purses).length == 0) {
+            continue;
+        }
 
+        let bundled = [];
+        
         if (deployBundle.has(Deploy.UPDATE_PURSE_DATA)) {
           const dataQueue = deployBundle.get(Deploy.UPDATE_PURSE_DATA);
           for (var i = 0; i < dataQueue.length; i++) {
-            const dataDeploy = dataQueue.at(i);
+            const dataDeploy = dataQueue[i];
 
             const chunkId = dataDeploy.payload.pos / 4096;
 
@@ -276,7 +517,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
             }
 
             //deploy would be too large
-            if (payload.data[dataDeploy.payload.purseId] && Object.keys(payload.data[dataDeploy.payload.purseId]).length > 2048 ) {
+            if (payload.data[dataDeploy.payload.purseId] && Object.keys(payload.data[dataDeploy.payload.purseId]).length > maxChunks ) {
               break
             }
 
@@ -285,8 +526,12 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
             combinedSuccessMap2.push(dataDeploy.success);
             combinedRevertsMap2.push(dataDeploy.revert);
 
-            deploys.set(Deploy.UPDATE_PURSE_DATA.toString() + dataDeploy.id, dataDeploy);
-            deployBundle.set(Deploy.UPDATE_PURSE_DATA, dataQueue.filter( el => el.id !== dataDeploy.id));
+            deploys.set(dataDeploy.id, dataDeploy);
+
+            const filtered = deployBundle.get(Deploy.UPDATE_PURSE_DATA).filter( el => el.id !== dataDeploy.id);
+
+            deployBundle.set(Deploy.UPDATE_PURSE_DATA, filtered);
+
             bundled.push(chunkId);
           }
         }
@@ -295,7 +540,7 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           const priceQueue = deployBundle.get(Deploy.UPDATE_PURSE_PRICE);
 
           for (var i = priceQueue.length - 1; i >= 0; i--) {
-            const priceDeploy = priceQueue.at(i);
+            const priceDeploy = priceQueue[i];
 
             if (!Object.keys(payload.purses).includes(priceDeploy.id)) {
               continue;
@@ -314,6 +559,8 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
           }
         }
         */
+
+        payload.data = Object.fromEntries(Object.entries(payload.data).map(([k,v], i) => [k, Object.values(v)])) ;
 
         try {
           
@@ -394,19 +641,20 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
                 purseId: purseId,
                 boxId: boxId,
                 contractId: contractName,
-                data: {}
+                data: {},
+                pos: 0,
               };
 
               let combinedSuccessMap = new Array<() => any>();
               let combinedRevertsMap = new Array<() => any>();
 
               for (var i = 0; i < queueLength3; i++) {
-                const data = queue3.at(i);
+                const data = queue3[i];
 
                 const chunkId = data.payload.pos / 4096;
 
                 //deploy would be too large
-                if (Object.keys(payload3.data).length > 2048 ) {
+                if (Object.keys(payload3.data).length > maxChunks ) {
                   break
                 }
 
@@ -415,18 +663,20 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
                 combinedRevertsMap.push(data.revert);
                 combinedSuccessMap.push(data.success);
 
-                deploys.set(data.deployType.toString() + data.id, data);
-              
-                deployBundle.set(Deploy.UPDATE_PURSE_DATA, queue.filter( el => el.id !== data.id));
+                deploys.set(data.id, data);
+                const filtered = deployBundle.get(deployType).filter( el => el.id !== data.id);
+
+                deployBundle.set(deployType, filtered);
+
                 processedChunks.push(chunkId);
               }
 
+              const pos = parseInt(Object.keys(payload3.data)[0]);
+              payload3.data = JSON.stringify(Object.values(payload3.data));
+              payload3.pos = pos;
 
-              payload3.data = JSON.stringify(payload3.data);
               const termGenerator = deployTermGenerators.get(deployType);
 
-              console.info("Deploying Chunks for purse " + purseId + ": ");
-              console.info(processedChunks);
               
               reverts.get(deployType).push(() => {
                 combinedRevertsMap.map(revert => revert());
@@ -449,8 +699,8 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
       //    continue
       default:
         for (var i = queueLength - 1; i >= 0; i--) {
-          const data = queue.at(i);
-          if (deploys.has(Deploy.UPDATE_PURSE_DATA.toString() + data.id)) {
+          const data = queue[i];
+          if (deploys.has(data.id)) {
             //Already processed
             continue;
           }
@@ -474,7 +724,6 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
             //queue.push(data);
           }
         }
-
         deployBundle.delete(deployType);
 
     }
@@ -487,16 +736,14 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
     ret = await Promise.all(promises);
   }
   else {
-    //Wait a minimum of 1 second.
-    //await new Promise(resolve => setTimeout(resolve, 1000));
-    return;
+    return deployBundle;
   }
 
   ret.forEach((deployRet, i) => {
     const deployType = findDeployTypeById[i];
 
     if (!deployType) {
-      return;
+      return deployBundle;
     }
 
     const data = rchainToolkit.utils.rhoValToJs(
@@ -506,139 +753,125 @@ const deployBundler = async function(deployBundle: Map<number, Array<DeployType>
     switch (deployType) {
       case Deploy.DEPLOY_BOX:
         if (data.status === 'completed') {
-          console.info("Box deployed!");
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.CREATE_PURSES:
-        if (data.status === 'completed') {
-          console.info("created purses");
+        if (data.status === 'completed' && data.results) {
           for (const [uniqueId, res] of Object.entries(data.results)) {
             if (res === false) {
-              const deploy = deploys.get(deployType.toString() + uniqueId);
+              const deploy = deploys.get(parseInt(uniqueId));
               deploy.revert();
-              const deploy2 = deploys.get(Deploy.UPDATE_PURSE_DATA.toString() + uniqueId);
+              const deploy2 = deploys.get(parseInt(uniqueId));
               deploy2.revert();
             } else {
-              successMap.get(deployType).at(i)();
-              successMap.get(Deploy.UPDATE_PURSE_DATA).at(i)();
+              successMap.get(deployType)[i](); //TODO: check
+              successMap.get(Deploy.UPDATE_PURSE_DATA)[i]();
             }
           }
 
           deployBundle.delete(deployType);
         }
         else {
-          //reverts.get(deployType).at(i)();
+          //reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.DELETE_PURSE:
-
         if (data.status === 'completed') {
-          console.info("deleted purse");
-          //successMap.get(deployType).at(i)();
+          //successMap.get(deployType)[i]();
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.CREDIT:
 
         if (data.status === 'completed') {
-          console.info("credited");
-          //successMap.get(deployType).at(i)();
+          //successMap.get(deployType)[i]();
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.UPDATE_PURSE_DATA:
-
         if (data.status === 'completed') {
-          console.info("updated purse data");
-          successMap.get(deployType).at(i)();
+          successMap.get(deployType)[i]();
           //deployBundle.delete(deployType);
         }
         else {
-          //reverts.get(deployType).at(i)();
+          //reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.UPDATE_PURSE_PRICE:
-        console.info("case Deploy.UPDATE_PURSE_PRICE");
         if (data.status === 'completed') {
-          console.info("updated purse price");
-          //successMap.get(deployType).at(i)();
+          //successMap.get(deployType)[i]();
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.WITHDRAW:
 
         if (data.status === 'completed') {
-          console.info("withdrew");
-          //successMap.get(deployType).at(i)();
+          //successMap.get(deployType)[i]();
           deployBundle.delete(deployType);
         }
         else {
-          reverts.get(deployType).at(i)();
+          reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
       case Deploy.SWAP:
 
         if (data.status === 'completed') {
-          console.info("swapped");
-          //successMap.get(deployType).at(i)();
+          //successMap.get(deployType)[i]();
           deployBundle.delete(deployType);
         }
         else {
-          //reverts.get(deployType).at(i)();
+          //reverts.get(deployType)[i]();
         }
 
-        return ret;
+        return deployBundle;
         case Deploy.CREDIT_AND_SWAP:
 
           if (data.status === 'completed') {
-            console.info("credited and swapped");
-            //successMap.get(deployType).at(i)();
+            //successMap.get(deployType)[i]();
             deployBundle.delete(deployType);
           }
           else {
-            reverts.get(deployType).at(i)();
+            reverts.get(deployType)[i]();
           }
   
-          return ret;
+          return deployBundle;
       default:
-        console.info("unknown deploy deployType ", deployType);
+        //console.info("unknown deploy deployType ", deployType);
+        return deployBundle
     }
   })
 
-  if (ret.length > 0) {
-    console.info(ret);
-    console.info("deployed %d deploys", ret.length);
-  }
-  return ret;
+  return deployBundle;
   
 }
 
 
-const bulkExploreDeploy = async function (deployType: ExploreDeploy, payload: any, priority?: number) {
+const bulkExploreDeploy = async function (deployType: ExploreDeploy, payload: any, success?: (ret: any) => any, priority?: number) {
   const result = await readQueue.handle({
     deployType: deployType,
     payload: payload,
-    priority: priority || 0
+    priority: priority || 0,
+    success: success
   });
   return result;
 }
@@ -654,58 +887,81 @@ const bulkDeploy = async function (deployType: Deploy, payload: any, revert?: ()
   return result;
 }
 
+const FetchChunks = (node: Node, pos: number, len: number, purseName: string, aheadRead2: number, chunksToRead: number[], aheadChunks: number[]) : Promise<boolean> => {
+  return new Promise<any>(async (resolve, reject) => {
+    await bulkExploreDeploy(ExploreDeploy.READ_PURSES_DATA, {
+      masterRegistryUri: masterRegistryUri,
+      pursesIds: [purseName],
+      contractId: contractName,
+      chunks: {
+        [purseName] : [...chunksToRead, ...aheadChunks]
+      }
+    }, async (result) => {
+      const parsedResult = JSON.parse(result);
 
+      //TODO: Shouldn't be necessary if data is intact, but just in case handle errors
+      //if (typeof parsedResult === 'string' && parsedResult.startsWith("Unexpected error")) {
+        //console.info("Found err");
+        //resolve(false);
+      //}
 
-let validatorArray = [];
-if (options.validatorHost) {
-  validatorArray = [...options.validatorHost];
-}
-const numberOfValidators = validatorArray.length;
+      const retData = rchainToolkit.utils.rhoValToJs(parsedResult.expr[0]);
+      
+      if (retData[purseName]) {
+        /*
+        let totalLength = 0;
 
+        Object.keys(retData[purseName]).forEach((chunkId: string) => {
+          const data = retData[purseName][chunkId];
+          const chunkContent = Buffer.from(data, 'base64url');
+          totalLength += chunkContent.length;
+        });
+        */
 
-let readOnlyArray = [];
-if (options.readOnlyHost) {
-  readOnlyArray = [...options.readOnlyHost];
-}
-const numberOfObservers = readOnlyArray.length;
+        var b = Buffer.alloc(len + aheadRead2 * 4096);
+        /* //TODO.....
+        Object.keys(retData[purseName]).forEach((chunkId: string) => {
+          const data = retData[purseName][chunkId];
+          const dataAsStr = Buffer.from(data, "base64url");
+          const chunkb = Buffer.from(data.toString("utf8"), 'base64url');
+          chunkb.copy(b, (parseInt(chunkId) - chunkStart) * 4096, 0, dataAsStr.length);
+        });
+        */
+        retData[purseName].forEach((chunk: string, chunkId: number) => {
+          const data = chunk;
+          const dataAsStr = Buffer.from(data, "base64url");
+          const chunkb = Buffer.from( data, 'base64url');
+          chunkb.copy(b, chunkId * 4096, 0, dataAsStr.length);
+        });
 
+        const chunkData2 = b.slice(0, len + aheadRead2 * 4096);
+        const nodeContent = await getNodeContent(node);
+        const fillData = Buffer.alloc(Math.max(0, pos - nodeContent.length));
+        const chunkDataRest = nodeContent.slice(pos + chunkData2.length, nodeContent.length);
+        const str2 = Buffer.concat([
+          nodeContent.slice(0, pos),
+          fillData,
+          chunkData2,
+          chunkDataRest
+        ]);
 
+        await updateNodeContent(node, str2, false, [...chunksToRead, ...aheadChunks]);
 
-for (let i = 0; i < 1000; i++) { //
-  writeBundleQueue.registerHandler(async (data: BundledDeployType) => {
-    console.info("................................");
-    const term = data.termGenerator(data.payload);
+        resolve(true);
+      }
 
-    const ret = await rchainToolkit.http.easyDeploy(
-      validatorArray[i % numberOfValidators],
-      term,
-      privateKey,
-      1,
-      maxPhloLimit,
-      50 * 60 * 1000
-    ).catch(err => {
-      console.info("Cought error, retrying");
-      console.info(err);
-      writeBundleQueue.handle(data);
     });
-    console.info("Deployed. Waiting for block.");
-
-    return ret;
+    resolve(true);
   });
 }
 
-let pubKey = rchainToolkit.utils.publicKeyFromPrivateKey(privateKey);
-
-
 const ops = {
   init: async function(cb: FuseCallback) {
-    console.info("INIT RDRIVE");
-
     const rootNode = mkDir("", "");
     setPathNode("", rootNode);
     setPathNode(pathSep, rootNode);
 
-    mkFile(pathSep, "token.conf", "{\n \"price\": 0\n}\n");
+    await mkFile(pathSep, ".token.conf", "{\n \"price\": " +pursePrice+ "\n}\n");
 
     const result = await bulkExploreDeploy(ExploreDeploy.READ_BOXES, { masterRegistryUri: masterRegistryUri});
     const boxesResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
@@ -722,7 +978,6 @@ const ops = {
   },
   readdir: async function (inPath: string, cb: FuseCallback) {
 
-    console.info("readdir");
     if (inPath !== '/') {
       const boxName = inPath.split("/")[1];
       const purseName = path.basename(inPath);
@@ -734,12 +989,8 @@ const ops = {
       if (boxResult && boxResult.purses) {
         const purses = boxResult.purses[contractName];
         const revPurses = boxResult.purses["rev"];
-        console.info("Got purses: ");
-        console.info(boxResult);
-
 
         if (revPurses && revPurses.length > 0) {
-          console.info("has rev");
 
           const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES, {
             masterRegistryUri: masterRegistryUri,
@@ -755,31 +1006,27 @@ const ops = {
           const node = getPathNode(pathSep + boxName + pathSep + "revbalance.rev");
 
           if (!node) {
-            console.info("making revbalance.rev");
-            mkFile(pathSep + boxName, "revbalance.rev", balance.toString() + "\n");
+            await mkFile(pathSep + boxName, "revbalance.rev", balance.toString() + "\n");
           }
           else {
             //Update balance
-            updateNodeContent(node, balance.toString() + "\n");
+            await updateNodeContent(node, balance.toString() + "\n");
           }
         }
         if (purses && purses.length > 0) {
-          console.info("purses:");
-          console.info(purses);
           const pursesResult = await bulkExploreDeploy(ExploreDeploy.READ_PURSES, {
             masterRegistryUri: masterRegistryUri,
             contractId: contractName,
             pursesIds: purses,
           });
           const pursesInfo = rchainToolkit.utils.rhoValToJs(JSON.parse(pursesResult).expr[0]);
-          console.info(pursesInfo);
 
-          purses.forEach((purse: string) => {
+          purses.forEach(async (purse: string) => {
             const purseInfo = pursesInfo[purse];
             const node = getPathNode(pathSep + boxName + pathSep + purse);
 
             if (!node) {
-              const fileNode = mkFile(pathSep + boxName, purse, "");
+              const fileNode = await mkFile(pathSep + boxName, purse, "");
               fileNode.isFinalized = true;
 
               const nOfChunks = purseInfo.chunks  || 1;
@@ -793,7 +1040,6 @@ const ops = {
               if (prevBlocksSize !== fileNode.stat.blocks) {
                 adjustBlocksUsed(fileNode.stat.blocks - prevBlocksSize);
               }
-              console.info(fileNode.stat);
 
               const f = mkFd(fileNode);
             }
@@ -802,11 +1048,11 @@ const ops = {
               
               const node2 = getPathNode(pathSep + boxName + pathSep + "." + purse + "." + contractName);
               if (!node2) {
-                const fileConfigNode = mkFile(pathSep + boxName, "." + purse + "." + contractName, `{\n price: ${purseInfo.price[1]}\n}\n`);
+                const fileConfigNode = await mkFile(pathSep + boxName, "." + purse + "." + contractName, `{\n price: ${purseInfo.price[1]}\n}\n`);
                 mkFd(fileConfigNode);
               }
               else {
-                updateNodeContent(node2, `{\n \"price\": ${purseInfo.price[1]}\n}\n`);
+                await updateNodeContent(node2, `{\n \"price\": ${purseInfo.price[1]}\n}\n`);
               }
             }
           });
@@ -826,8 +1072,6 @@ const ops = {
     return process.nextTick(cb, 0, node.children.map((c: any) => c.name));
   },
   create: async function (inPath: string, mode: number, cb: FuseCallback) {
-    console.info("create");
-
     let node: Node | null = null;
     const p = inPath.split(pathSep);
     const boxId = p[1];
@@ -841,20 +1085,21 @@ const ops = {
     if (name.length > getFsStats().max_name_length) {
       return process.nextTick(cb, Fuse.ENAMETOOLONG);
     }
-
+    
     const result = await bulkExploreDeploy(ExploreDeploy.READ_BOX, { masterRegistryUri: masterRegistryUri, boxId: boxId});
 
     const boxResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
 
     if (boxResult && boxResult.publicKey !== pubKey) {
-      console.info("Can't create purse in a box that is not yours!");
+      //console.info("Can't create purse in a box that is not yours!");
       return process.nextTick(cb, Fuse.EACCES);
     }
 
-    const contractConfigFileNode = getPathNode(pathSep + "token.conf");
+    const contractConfigFileNode = getPathNode(pathSep + ".token.conf");
     let price = 0;
-    if (contractConfigFileNode && contractConfigFileNode.content) {
-      const config = JSON.parse(contractConfigFileNode.content.toString());
+    const nodeContent = await getNodeContent(contractConfigFileNode);
+    if (contractConfigFileNode && nodeContent) {
+      const config = JSON.parse(nodeContent.toString());
       price = parseInt(config.price);
     }
 
@@ -876,13 +1121,18 @@ const ops = {
 
       let fileConfigNode = getPathNode(inPath);
       if (!fileConfigNode) {
-        const fileConfigNode = mkFile(p.join(pathSep), "." + name + "." + contractName, "{\n \"price\": " + price + "\n}\n", mode);
+        const fileConfigNode = await mkFile(p.join(pathSep), "." + name + "." + contractName, "{\n \"price\": " + price + "\n}\n", mode);
         mkFd(fileConfigNode);
       }
+  
+      const progressBar = multibar.create(1, 0, {
+        name: inPath
+      }, {clearOnComplete: true});
+      progressBars.set(inPath, progressBar);
+      //flush();
 
       bulkDeploy(Deploy.CREATE_PURSES, payload, () => {
         //Revert on failure
-        console.info("FAILED to create purse " + name);
         const node2 = getPathNode(inPath);
         if (node2) {
           const parentPath = getPathFromName(inPath);
@@ -894,15 +1144,12 @@ const ops = {
         if (node2) {
           node2.isFinalized = true;
         }
-
-        console.info("PURSE CREATED");
-        console.info(inPath);
       });
     }
 
 
     if (isRegularFile(mode)) {
-      node = mkFile(p.join(pathSep), name, "", mode);
+      node = await mkFile(p.join(pathSep), name, "", mode);
     } else if (isDirectory(mode)) {
       node = mkDir(p.join(pathSep), name, mode);
     }
@@ -916,7 +1163,6 @@ const ops = {
     return process.nextTick(cb, 0, f);
   },
   mknod: async function (path: string, mode: number, rdev: number, cb: FuseCallback) {
-    console.info("mknod");
     return process.nextTick(cb, 0);
   },
   getattr: async function (inPath: string, cb: FuseCallback) {
@@ -941,7 +1187,6 @@ const ops = {
     return cb(0)
   },
   read: async function (inPath: string, fd: any, buf: any, len: number, pos: number, cb: FuseCallback) {
-    console.info("read() ", len, pos);
     const chunkStart = pos / 4096;
     const chunksLength = len / 4096;
     const boxName = inPath.split("/")[1];
@@ -969,75 +1214,59 @@ const ops = {
       */
     }
 
-    //if (!node.content) {
-    //  console.info("Has content");
-    //  return process.nextTick(cb, 0);
-    //}
-    if (node.content) {
-      const str = node.content.slice(pos, pos + len);
-      if (str.length == 0 && !isSpecialFile) {
+    const nodeContent = await getNodeContent(node);
+    if (nodeContent) {
+      const localContent = nodeContent.slice(pos, pos + len);
+      const blocks = node.stat.blocks / 8;
+      const lastChunk = (pos + len) / 4096;
 
-        const chunksToRead = [...Array(chunksLength).keys()].map(i => i + chunkStart).filter(i => i < node.stat.blocks);
+      const chunksToRead = [...Array(chunksLength).keys()].map(i => i + chunkStart).filter(i => i < blocks);
+      const remoteChunks = chunksToRead.filter(x => !node.chunksRead.includes(x)); //Chunks that don't exist in cache yet.
 
-        if (inPath.split("/").length > 2 && chunksToRead.length > 0 && !isSpecialFile) {
-          const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES_DATA, {
-            masterRegistryUri: masterRegistryUri,
-            pursesIds: [purseName],
-            contractId: contractName,
-            chunks: {
-              [purseName] : chunksToRead
-            }
-          });
-    
-          console.info("reading chunks: ");
-          console.info(chunksToRead );
-          const parsedResult = JSON.parse(result);
-    
-          if (parsedResult.expr.length == 0) {
-            return process.nextTick(cb, 0);
-          }
+
+      //There is no need to read from chain if we have all the chunks in memory, but we still want to continue reading ahead in reasonable amounts.
+      if (remoteChunks.length == 0 && !isSpecialFile) {
+          const futureRead = [...Array(maxReadChunks).keys()].map(i => i + chunkStart).filter(i => i < blocks && !node.chunksRead.includes(i));
+          const futureReadDiff = futureReadMap.get(inPath) == futureRead.length;
+          futureReadMap.set(inPath, futureRead.length);
           
-          const retData = rchainToolkit.utils.rhoValToJs(parsedResult.expr[0]);
-    
-          if (retData[purseName]) {
-            /*
-            let totalLength = 0;
-    
-            Object.keys(retData[purseName]).forEach((chunkId: string) => {
-              const data = retData[purseName][chunkId];
-              const chunkContent = Buffer.from(data, 'base64url');
-              totalLength += chunkContent.length;
-            });
-            */
-    
-            var b = Buffer.alloc(len);
-            Object.keys(retData[purseName]).forEach((chunkId: string) => {
-              const data = retData[purseName][chunkId];
-              const dataAsStr = Buffer.from(data, "base64url");
-              const chunkb = Buffer.from(data.toString("utf8"), 'base64url');
-              chunkb.copy(b, (parseInt(chunkId) - chunkStart) * 4096, 0, dataAsStr.length);
-            });
-    
-            const chunkData = b.slice(0, len);
-            const str = Buffer.concat([
-              node.content.slice(0, pos),
-              chunkData
-            ]);
-            chunkData.copy(buf);
-    
-            const ret = updateNodeContent(node, str);
-    
-            return process.nextTick(cb, ret < 0 ? ret : len);
+          //Predict read ahead and fetch chunks before we run out of cache
+          //Read at least 1024 chunks ahead, or what's remaining.
+          if (futureRead.length > 1024 || (futureRead.length > 0 && futureReadDiff)) {
+            node.chunksRead = [...new Set([...node.chunksRead ,...futureRead])]; //TODO: revert if not read;
+            FetchChunks(node, futureRead[0] * 4096, futureRead.length, purseName, futureRead.length, [], futureRead);
           }
-        }
-
-
-        return process.nextTick(cb, 0);
       }
+      
+      //Some chunks need to be read immediately.
+      if (remoteChunks.length > 0 && !isSpecialFile) {
+        const aheadRead = maxReadChunks - chunksToRead.length;
 
+        let aheadChunks = [];
+        
+        if (chunksToRead.length < maxReadChunks && (chunksToRead[0] + chunksToRead.length) < blocks ) {
+          aheadChunks = [...Array(aheadRead).keys()].map(i => i + chunksToRead[chunksToRead.length - 1] + 1).filter(i => i < blocks);
+        }
+        let aheadRead2 = aheadChunks.length;
+        
+        if (lastChunk <= blocks && inPath.split("/").length > 2 && chunksToRead.length > 0) {
+          await FetchChunks(node, pos, len, purseName, aheadRead2, chunksToRead, aheadChunks);
+
+          const nodeContent2 = await getNodeContent(node);
+          const remoteContent = nodeContent2.slice(pos, pos + len);
+          
+          remoteContent.copy(buf);
+          return process.nextTick(cb, len);
+        }
+        else {
+          return process.nextTick(cb, len);
+        }
+        
+      }
       else {
-        str.copy(buf);
-        return process.nextTick(cb, str.length);
+        //Continue to read from cache
+        localContent.copy(buf);
+        return process.nextTick(cb, len);
       }
     }
 
@@ -1051,7 +1280,6 @@ const ops = {
     return process.nextTick(cb, 0);
   },
   ftruncate: async function (inPath: string | Buffer, fd: number, size: any, cb: FuseCallback) {
-    console.info("ftruncate", size);
     const node = getPathNode(inPath.toString());
     //const node = getFdNode(fd);
     if (!node) {
@@ -1109,7 +1337,6 @@ const ops = {
     return process.nextTick(cb, 0);
   },
   write: async function (inPath: string, fd: any, buf: any, length: number, pos: number, cb: FuseCallback) {
-    //console.info("write() ", length, pos);
     const boxName = inPath.split("/")[1];
     const purseName = path.basename(inPath);
     const extension = path.extname(purseName);
@@ -1121,44 +1348,44 @@ const ops = {
     }
   
     let content: Buffer;
-    if (!node.content) {
-      node.content = Buffer.alloc(length + pos);
-    }
+
+    const nodeContent = await getNodeContent(node);
     if (pos) {
       content = Buffer.concat([
-        node.content.slice(0, pos),
+        nodeContent.slice(0, pos),
         buf.slice(0, length)
       ]);
     } else {
       content = Buffer.from(buf.slice(0, length));
     }
-
-    const ret = updateNodeContent(node, content);
+    const ret = await updateNodeContent(node, content);
 
     const boxNode = getPathNode(pathSep + boxName);
     if (boxNode && !boxNode.owner && isDirectory(boxNode.stat.mode)) {
+      //TODO: Memorize this
+      /*
       const result = await bulkExploreDeploy(ExploreDeploy.READ_BOX, { masterRegistryUri: masterRegistryUri, boxId: boxName});
       const boxResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
 
       if (boxResult && boxResult.publicKey !== pubKey) {
-        console.info("Can't update data in a box that is not yours!");
+        //console.info("Can't update data in a box that is not yours!");
         return process.nextTick(cb, Fuse.EACCES);
       }
 
       if (boxResult) {
         changeNodeOwner(boxNode, boxName)
       }
+      */
     }
 
 
     if (!isHiddenFile) {
       if (extension === ".rev") {
-        console.info("updating rev balance...");
         const result = await bulkExploreDeploy(ExploreDeploy.READ_BOX, { masterRegistryUri: masterRegistryUri, boxId: boxName});
         const boxResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
   
         if (boxResult && boxResult.publicKey !== pubKey) {
-          console.info("Can't update data in a box that is not yours!");
+
           return process.nextTick(cb, Fuse.EACCES);
         }
         
@@ -1166,14 +1393,10 @@ const ops = {
           const purses = boxResult.purses[contractName];
           const revPurses = boxResult.purses["rev"];
 
-          console.info("Got purses: ");
-          console.info(boxResult);
-
           let currentBalance = 0;
 
           if (revPurses && revPurses.length > 0) {
-            console.info("has rev");
-
+            //Has REV
             const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES, {
               masterRegistryUri: masterRegistryUri,
               contractId: "rev",
@@ -1188,7 +1411,7 @@ const ops = {
           const topUp = desiredBalance - currentBalance;
           
           if (topUp > 0) {
-            console.info("top up...");
+            //TOP UP
             const payload = {
               revAddress: rchainToolkit.utils.revAddressFromPublicKey(pubKey),
               quantity: topUp,
@@ -1199,7 +1422,6 @@ const ops = {
           }
           if (topUp < 0) {
             //Do withdraw
-            console.info("Withdrawing... ");
             const payload = {
               masterRegistryUri: masterRegistryUri,
               withdrawQuantity: Math.abs(topUp),
@@ -1220,22 +1442,19 @@ const ops = {
           boxId: boxName,
           contractId: contractName,
           data: Buffer.from(buf.slice(0, length), "utf8").toString("base64url"), //Buffer.from(content),
-          //Additional chunk data
           length: length,
           pos: pos,
         };
+          const progress = progressBars.get(inPath);
+          progress.setTotal(pos + length);
 
-        //try {
           bulkDeploy(Deploy.UPDATE_PURSE_DATA, payload, () => {}, purseName+"@"+boxName, () => {
-            //node.isFinalized = true;
+            progress.increment(length);
           });
-
-          //console.info("File saved!");
       }
     }
     else {
         //Update purse config
-        console.info("Update purse config");
         if (content) {
           const conf = JSON.parse(content.toString());
           const purseId = purseName.slice(0, -(contractName.length+1)).substring(1);
@@ -1267,12 +1486,9 @@ const ops = {
       adjustBlocksUsed(node.stat.blocks - prevBlocksSize);
     }
     
-  
     return process.nextTick(cb, ret < 0 ? ret : length);
   },
   rename: async function(src: string, dst: string, cb: FuseCallback) {
-    console.info("rename");
-
     const srcBoxName = src.split("/")[1];
     const srcPurseName = path.basename(src);
 
@@ -1318,14 +1534,15 @@ const ops = {
             let quantity = 1;
             let purseId = purseName;
             let currentBalance = 0;
-            if (extension === ".rev" && srcNode.content) {
-              quantity = parseInt(srcNode.content.toString());
+            const srcNodeContent = await getNodeContent(srcNode);
+            if (extension === ".rev" && srcNodeContent) {
+              quantity = parseInt(srcNodeContent.toString());
 
               const result = await bulkExploreDeploy(ExploreDeploy.READ_BOX, { masterRegistryUri: masterRegistryUri, boxId: srcBoxName});
               const boxResult = rchainToolkit.utils.rhoValToJs(JSON.parse(result).expr[0]);
         
               if (boxResult && boxResult.publicKey !== pubKey) {
-                console.info("Can't move rev from a purse that isn't yours!");
+                //console.info("Can't move rev from a purse that isn't yours!");
                 return process.nextTick(cb, Fuse.EACCES);
               }
               
@@ -1333,12 +1550,9 @@ const ops = {
                 //const purses = boxResult.purses[contractName];
                 const revPurses = boxResult.purses["rev"];
                 purseId = revPurses[0];
-                console.info("boxResult:");
-                console.info(boxResult);
 
                 if (revPurses && revPurses.length > 0) {
-                  console.info("has rev");
-      
+                  //Has REV
                   const result = await bulkExploreDeploy(ExploreDeploy.READ_PURSES, {
                     masterRegistryUri: masterRegistryUri,
                     contractId: "rev",
@@ -1361,12 +1575,12 @@ const ops = {
                 contractId: extension === ".rev" ? "rev" : contractName,
                 merge: false,
               };
-              bulkDeploy(Deploy.WITHDRAW, payload, () => {
-                console.info("transaction unsuccessful! :(");
+              bulkDeploy(Deploy.WITHDRAW, payload, async () => {
+                //console.info("transaction unsuccessful! :(");
                 //Revert to previous balance
-                mkFile(src, purseName, currentBalance.toString());
+                await mkFile(src, purseName, currentBalance.toString());
               }, purseName, () => {
-                console.info("transaction successful! :)");
+                //console.info("transaction successful! :)");
               });
             }
         }
@@ -1406,10 +1620,6 @@ const ops = {
     return process.nextTick(cb, 0);
   },
   mkdir: async function (inPath: string, mode: number, cb: FuseCallback) {
-    console.info("mkdir");
-    console.info(inPath);
-    console.info(mode);
-
     let node: Node | null = null;
     const p = inPath.split(pathSep);
     const name = p.pop();
@@ -1473,41 +1683,56 @@ else if (options.down) {
 */
 
 function flush() {
-  process.stdout.clearLine(-1);
-  process.stdout.cursorTo(0);
+  console.clear();
 }
 
-const runFunction = async function () {
+const entryFunc = async function () {
+  flush();
+  pubKey = rchainToolkit.utils.publicKeyFromPrivateKey(options.privKey);
+
   if (!masterRegistryUri) {
-    console.info("No master registry uri, creating a new one");
+    console.info("No master registry uri, creating a new one. Please wait...");
     const term = masterTerm({
       depth: 3,
       contractDepth: 2,
     });
-
     let dataAtNameResponse;
     try {
       dataAtNameResponse = await rchainToolkit.http.easyDeploy(
-        VALIDATOR_HOST,
-        term,
-        privateKey,
-        1,
-        maxPhloLimit,
-        50 * 60 * 1000
+        validatorArray[0 % numberOfValidators],
+        {
+          term: term,
+          shardId: shardId,
+          privateKey: privateKey,
+          phloPrice: 'auto',
+          phloLimit: maxPhloLimit,
+          timeout: 250 * 60 * 1000
+        }
       );
     }
     catch (err) {
-      console.info(err);
+      //console.info(err);
     }
   
     const data = rchainToolkit.utils.rhoValToJs(
       JSON.parse(dataAtNameResponse).exprs[0].expr
     );
-  
-    masterRegistryUri = data.registryUri.replace('rho:id:', '');
-    console.info("Master Registry URI: %s", masterRegistryUri);
 
+    masterRegistryUri = data.registryUri.replace('rho:id:', '');
+  }
+
+  console.info("Master Registry URI: %s", masterRegistryUri);
+
+  const term = readBoxTerm({ masterRegistryUri: masterRegistryUri, boxId: defaultBoxName})
+  const boxResult = await rchainToolkit.http.exploreDeploy(readOnlyArray[0], {
+    term: term,
+  });
+
+  const data = rchainToolkit.utils.rhoValToJs(JSON.parse(boxResult).expr[0]);
+
+  if (typeof data === "string" && data.startsWith("error")) {
     //Deploy box
+    console.info("Deploying new box...");
     const term2 = deployBoxTerm({
       masterRegistryUri: masterRegistryUri,
       boxId: defaultBoxName,
@@ -1518,12 +1743,15 @@ const runFunction = async function () {
     let dataAtNameResponse2;
     try {
       dataAtNameResponse2 = await rchainToolkit.http.easyDeploy(
-        VALIDATOR_HOST,
-        term2,
-        privateKey,
-        1,
-        maxPhloLimit,
-        50 * 60 * 1000
+        validatorArray[0 % numberOfValidators],
+        {
+          term: term2,
+          shardId: shardId,
+          privateKey: privateKey,
+          phloPrice: 'auto',
+          phloLimit: maxPhloLimit,
+          timeout: 250 * 60 * 1000
+        }
       );
     }
     catch (err) {
@@ -1534,12 +1762,34 @@ const runFunction = async function () {
       JSON.parse(dataAtNameResponse2).exprs[0].expr
     );
   
-    if (data2.status !== 'completed') {
-      console.info("Unable to create box.");
-      return;
+    if (data2.status === 'completed') {
+      console.info("Folder " + defaultBoxName + " created.");
+      hasBox = true;
     }
+  } else {
+    hasBox = true;
+  }
 
-    //Deploy default contract
+  if (contractName) {
+    const term3 = readConfigTerm({ masterRegistryUri: masterRegistryUri, contractId: contractName})
+
+    const contractResult = await rchainToolkit.http.exploreDeploy(readOnlyArray[0], {
+      term: term3,
+    });
+
+
+    if (JSON.parse(contractResult).expr && JSON.parse(contractResult).expr.length > 0) {
+      //const contractData = rchainToolkit.utils.rhoValToJs(JSON.parse(contractResult).expr[0]);
+      hasContract = true;
+    }
+  }
+  else {
+    contractName = "default";
+  }
+  
+  if (hasBox && !hasContract) {
+    //Deploy personal contract
+    console.info("Deploying contract...");
     const term3 = deployTerm({
       masterRegistryUri,
       boxId: defaultBoxName,
@@ -1551,96 +1801,118 @@ const runFunction = async function () {
     let dataAtNameResponse3;
     try {
       dataAtNameResponse3 = await rchainToolkit.http.easyDeploy(
-        VALIDATOR_HOST,
-        term3,
-        privateKey,
-        1,
-        maxPhloLimit,
-        50 * 60 * 1000
+        validatorArray[0 % numberOfValidators],
+        {
+          term: term3,
+          shardId: shardId,
+          privateKey: privateKey,
+          phloPrice: 'auto',
+          phloLimit: maxPhloLimit,
+          timeout: 250 * 60 * 1000
+        }
       );
     }
     catch (err) {
       console.info(err);
     }
-  
+
     const data3 = rchainToolkit.utils.rhoValToJs(
       JSON.parse(dataAtNameResponse3).exprs[0].expr
     );
   
     if (data3.status !== 'completed') {
-      console.info("Unable to deploy contract.");
+      //console.info("Unable to deploy contract.");
       return;
     }
+
+    flush();
+    console.info("RDrive ready (with uri: " + masterRegistryUri + ")");
   }
 
   if (options.run) {
-    console.info("With --run");
     fuse2 = new Fuse(mntPath, ops, { displayFolder: "RDrive", mkdir: true, debug: false });
-    /*
-    const onError = (err) => {
-      console.error(err);
-    }
 
-    const onDone = () => {
-      deployPool.terminate(); // terminate all workers when done
-    }
-
-    const testFunc = async (somemap) => {
-      console.info("testFunc");
-    }
-
-    const onSuccess = (result) => {
-      console.log('bundle deployed successfully!!!', result);
-      deployPool.exec(testFunc, [new Map<number, DeployType[]>(deployQueue)], {workerType: 'process'})
-      .then(onSuccess)
-      .catch(onError)
-      .then(onDone);
-    }
-    */
-
-    const maxWaitTime = 5000;
+    let maxWaitTime = 10000;
     let deployBundlerInterval = undefined;
-
+    let processingLag = 0;
     const LoopFunc = async () => {
-      //console.info("Interval");
-      //process.stdout.write('Deploying ', () => {
-        
-      //});
-      /*
-      if (deployQueue.size > 0) {
-        deployPool.exec(testFunc, [new Map<number, DeployType[]>(deployQueue)], {workerType: 'process'})
-        .then(onSuccess)
-        .catch(onError)
-        .then(onDone);
+      //flush();
+      //console.info("RDrive ready (with uri: " + masterRegistryUri + ")");
+
+      //console.log(memoryUsage());
+
+
+      //Take a snapshot of the deploy queue, bundle as much as possible, and deploy it
+      const toProcess: Map<number, DeployType[]> = new Map<number, DeployType[]>();
+      
+      for (const [deployType, queue] of deployQueue) {
+        toProcess.set(deployType, [...queue]);
+        deployQueue.get(deployType).length = 0;
+        deployQueue.delete(deployType);
       }
-      */
+      if (toProcess.has(Deploy.UPDATE_PURSE_DATA)) {
+        processingLag = maxChunks - Math.round((processingLag + Math.min(maxChunks, toProcess.get(Deploy.UPDATE_PURSE_DATA).length)) / 2);
+        maxWaitTime = processingLag * (maxChunks / 8);
+      }
+      
+      
+      const deployBundleRemaining = await deployBundler(toProcess);
 
-      await deployBundler(deployQueue);
-
+      //Put deploys that weren't bundled back into the queue
+      for (const [deployType, queue] of deployBundleRemaining) {
+        if (!deployQueue.get(deployType)) {
+          deployQueue.set(deployType, []);
+        }
+        deployQueue.set(deployType, [...queue, ...deployQueue.get(deployType)]);
+      }
+      
 
       clearInterval(deployBundlerInterval);
-      //console.info("clearing deployQueue");
-      //deployQueue.clear();
-      //.info("bundle deployed successfully");
-      //flush();
+
       deployBundlerInterval = setInterval(LoopFunc, maxWaitTime);
     }
 
     deployBundlerInterval = setInterval(LoopFunc, maxWaitTime);
+    
+    
+    const maxExploreWaitTime = 500;
+    let exploreDeployBundlerInterval = undefined;
+    
+    const ExploreLoopFunc = async () => {
+      /*
+      const toProcess: Map<number, ExploreDeployType[]> = new Map<number, ExploreDeployType[]>();
+      for (const [deployType, queue] of exploreDeployQueue) {
+        toProcess.set(deployType, [...queue]);
+        exploreDeployQueue.get(deployType).length = 0;
+        exploreDeployQueue.delete(deployType);
+      }
 
-    //deployPool.exec(deployBundler, []);
+      const exploreDeployBundleRemaining = */ await exploreDeployBundler(exploreDeployQueue);
+      /*
+      for (const [deployType, queue] of exploreDeployBundleRemaining) {
+        exploreDeployQueue.set(deployType, [...queue, ...exploreDeployQueue.get(deployType)]);
+      }
+      */
+      
+      
+      clearInterval(exploreDeployBundlerInterval);
+
+      exploreDeployBundlerInterval = setInterval(ExploreLoopFunc, maxExploreWaitTime);
+    }
+
+    exploreDeployBundlerInterval = setInterval(ExploreLoopFunc, maxExploreWaitTime);
 
     service.run (function () {
-      fuse2?.unmount( () => {
+      fuse2?.unmount( async () => {
         logStream.write("Unmounted" + "\n");
         //TODO: Wait until all deploys are sent
         setTimeout(() => {
           clearInterval(deployBundlerInterval);
+          clearInterval(exploreDeployBundlerInterval);
           service.stop(0);
         }, 2000);
       });
     });
-
 
     
     logStream.write("Running service" + "\n");
@@ -1649,22 +1921,22 @@ const runFunction = async function () {
     })
     
 
-    process.on('SIGINT', () => {
-        console.info("Unmounting...");
+    process.on('SIGINT', async () => {
+        //console.info("Unmounting...");
         fuse2?.unmount( () => {
           logStream.write("Unmounted" + "\n");
           //TODO: Wait until all deploys are sent
           setTimeout(() => {
             clearInterval(deployBundlerInterval);
+            clearInterval(exploreDeployBundlerInterval);
             service.stop(0);
+            process.exit(0);
           }, 2000);
-          process.exit(0);
         });
     });
   }
   else if (options.clean) {
     if (fuse2) {
-      console.info("Unmounting2...")
       fuse2.unmount( () => {
         logStream.write("Unmounted" + "\n");
       });
@@ -1675,4 +1947,4 @@ const runFunction = async function () {
   }
 }
 
-runFunction();
+entryFunc();

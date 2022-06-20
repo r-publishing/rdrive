@@ -46,7 +46,9 @@ export interface Node {
   content?: Buffer; // used to store file contents or symlink targets
   owner?: string; // owner of node
   edit_time?: number; // last time node was edited, used for cache invalidation
-  isFinalized?: boolean; // If node exists within a finalized block
+  isFinalized?: boolean; // If node exists within a finalized block,
+  chunksRead: number[]; // Array of 4096 chunk ids that have been read from the chain
+  path: string;
 }
 
 export type IFsStats = {
@@ -161,7 +163,9 @@ export const getFsStats = (): IFsStats => FsStats;
 ): Node => {
   parentPath = ensureNoTrailingSlash(parentPath);
   const node: Node = {
-    stat: mkStatRec({mode, nlink: 1, size: FsStats.block_size})
+    chunksRead: [],
+    stat: mkStatRec({mode, nlink: 1, size: FsStats.block_size}),
+    path: parentPath === "/" ? `${parentPath}${name}` : `${parentPath}/${name}`,
   };
   node.children = []; // putting this here instead of above keeps typescript happy
   node.children.push({name: '.', node: node});
@@ -182,11 +186,12 @@ export const getFsStats = (): IFsStats => FsStats;
  * @param node File node to truncate
  * @param size Size to truncate content to. Usually zero
  */
- export const truncateFile = (node: Node, size = 0): void => {
-  if (node.content) {
-    node.content = node.content.slice(0, size);
+ export const truncateFile = async (node: Node, size = 0): Promise<void> => {
+  const nodeContent = await getNodeContent(node);
+  if (nodeContent) {
+    await updateNodeContent(node, nodeContent.slice(0, size));
   } else {
-    node.content = Buffer.alloc(size);
+    await updateNodeContent(node, Buffer.alloc(size));
   }
   FsStats.blocks_used -= node.stat.blocks;
   node.stat.size = size;
@@ -239,7 +244,7 @@ export const getFsStats = (): IFsStats => FsStats;
  */
  export const freePathNode = (path: string): boolean => path2Node.delete(path);
 
-
+ 
 
 
  
@@ -270,9 +275,6 @@ export const getFsStats = (): IFsStats => FsStats;
       parent.children.splice(i, 1);
       if (isDirectory(node.stat.mode)) {
         parent.stat.nlink--;
-        if (parent.stat.nlink < 0) {
-            //console.error('node nlink less than zero!!!!');
-        }
       }
       node.stat.nlink--;
       if (!node.stat.nlink) {
@@ -285,20 +287,35 @@ export const getFsStats = (): IFsStats => FsStats;
   return false;
 };
 
-export const updateNodeContent = (
+export const getNodeContent = async (node: Node): Promise<Buffer | undefined> => {
+  //TODO: replace with a persistent in-memory cache
+  return node.content;
+}
+
+export const updateNodeContent = async (
   node: Node,
   content: Buffer | string,
-  updateBlocks: boolean = false
-): number => {
+  updateBlocks: boolean = false,
+  chunks: number[] | undefined = undefined
+): Promise<number> => {
   if (!content) {
     content = Buffer.alloc(0);
   } else if (typeof content === "string") {
     content = Buffer.from(content);
   }
   node.edit_time = Date.now();
+
+  //TODO: replace with a persistent in-memory cache
   node.content = content;
+
+  if (chunks) {
+    node.chunksRead = [...new Set([...node.chunksRead ,...chunks])];
+  } else {
+    const contentChunks = Math.ceil(content.length / 4096);
+    node.chunksRead = [...Array(contentChunks).keys()];
+  }
   if (updateBlocks) {
-    node.stat.size = node.content.length;
+    node.stat.size = content.length;
     const blocks_before = node.stat.blocks;
     node.stat.blocks = Math.ceil(node.stat.size / node.stat.blksize);
     if (blocks_before !== node.stat.blocks) {
@@ -334,21 +351,25 @@ export const changeNodeOwner = (
  * @param mode File type and permissions
  * @returns File node
  */
- export const mkFile = (
+ export const mkFile = async (
   parentPath: string,
   name: string,
   content: string | Buffer,
   mode = 0o100644
-): Node => {
+): Promise<Node> => {
   parentPath = ensureNoTrailingSlash(parentPath);
   const node: Node = {
+    chunksRead: [],
     stat: mkStatRec({
       mode,
       size: content.length
     }),
-    content: typeof content === 'string' ? Buffer.from(content) : content,
+    path: parentPath === "/" ? `${parentPath}${name}` : `${parentPath}/${name}`,
     edit_time: Date.now()
   };
+  
+  await updateNodeContent(node, typeof content === 'string' ? Buffer.from(content) : content); 
+  
   const parentNode = getPathNode(parentPath);
   if (parentNode) {
     addNodeToParent(

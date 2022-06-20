@@ -51,7 +51,7 @@
     "@types/byte-size": "^8.1.0",
     "@types/cli-progress": "^3.11.0",
     "nodemon": "^2.0.15",
-    "pika-plugin-pkg-node": "*",
+    "pika-plugin-pkg-node": "https://github.com/TheoXD/pika-plugin-pkg-node.git",
     "typescript": "^4.5.2"
   },
   "@pika/pack": {

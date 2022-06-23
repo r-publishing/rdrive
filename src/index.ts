@@ -15,7 +15,7 @@ import Fuse from './fusen';
 
 import * as rchainToolkit from "@fabcotech/rchain-toolkit";
 
-import { createRequire } from 'module';
+import { createRequire } from 'node:module';
 
 import {
   FuseCallback,

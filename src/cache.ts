@@ -10,7 +10,7 @@ import {
   } from './utils';
 
 
-import { createRequire } from 'module';
+//import { createRequire } from 'module';
 import { getHeapStatistics } from 'v8';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

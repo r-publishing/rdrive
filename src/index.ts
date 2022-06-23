@@ -15,7 +15,7 @@ import Fuse from './fusen';
 
 import * as rchainToolkit from "@fabcotech/rchain-toolkit";
 
-import { createRequire } from 'node:module';
+import { createRequire } from 'module';
 
 import {
   FuseCallback,
@@ -142,7 +142,8 @@ const deployTermGenerators = new Map<Deploy, TermGeneratorFunction>([
 //const fileBuff = fs.readFileSync(messageFileURL.pathname);
 //const { value } = JSON.parse(fileBuff.toString());
 
-const QueuedJobs = require2("queued-jobs").default;
+import QueuedJobs from "queued-jobs";
+
 const readQueue = new QueuedJobs(40960, 999 * 60 * 1000);
 const writeQueue = new QueuedJobs(40960, 999 * 60 * 1000);
 
@@ -220,6 +221,7 @@ readQueue.registerHandler(async (data: ExploreDeployType, requestId: number) => 
       exploreDeployQueue.get(data.deployType).push(data);
     }
 
+    // @ts-ignore
     readQueue.once(`resolve:${requestId}`, (result) => {
       resolve(result)
     })
@@ -434,6 +436,7 @@ const exploreDeployBundler = async function(exploreDeployBundle: Map<number, Arr
         }
 
         exploreDeployBundle.delete(deployType);
+        // @ts-ignore
         readQueue.dispatchEvent(`resolve:${deployRet.data.id.toString()}`, deployRet.ret);
     }
 

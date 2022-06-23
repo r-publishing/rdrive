@@ -13,8 +13,6 @@ import {
 import { createRequire } from 'module';
 import { getHeapStatistics } from 'v8';
 
-const require = createRequire(import.meta.url);
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type FuseCallback = (err: number, ...args: any[]) => void;
 

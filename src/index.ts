@@ -15,8 +15,6 @@ import Fuse from './fusen';
 
 import * as rchainToolkit from "@fabcotech/rchain-toolkit";
 
-import { createRequire } from 'module';
-
 import {
   FuseCallback,
   setPathNode,
@@ -44,8 +42,6 @@ import { constants } from 'fs';
 
 import cliProgress from "cli-progress";
 import byteSize from "byte-size";
-
-const require2 = createRequire(import.meta.url);
 
 import {
   masterTerm,

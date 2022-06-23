@@ -11,7 +11,7 @@ import process from "process";
 import path from 'path';
 import Fuse from './fusen';
 
-import { memoryUsage } from 'node:process';
+// import { memoryUsage } from 'node:process';
 
 import * as rchainToolkit from "@fabcotech/rchain-toolkit";
 

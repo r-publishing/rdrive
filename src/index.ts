@@ -11,11 +11,9 @@ import process from "process";
 import path from 'path';
 import Fuse from './fusen';
 
-import { memoryUsage } from 'node:process';
+// import { memoryUsage } from 'node:process';
 
 import * as rchainToolkit from "@fabcotech/rchain-toolkit";
-
-import { createRequire } from 'module';
 
 import {
   FuseCallback,
@@ -45,9 +43,7 @@ import { constants } from 'fs';
 import cliProgress from "cli-progress";
 import byteSize from "byte-size";
 
-const require = createRequire(import.meta.url);
-
-const {
+import {
   masterTerm,
   deployTerm,
   readPursesTerm,
@@ -65,12 +61,13 @@ const {
   creditTerm,
   swapTerm,
   creditAndSwapTerm
-} = require("rchain-token");
+} from "rchain-token";
 
-const service = require("os-service");
-const commandLineArgs = require('command-line-args')
+import service from "os-service";
+import commandLineArgs from 'command-line-args';
 
-require('events').EventEmitter.defaultMaxListeners = 20000;
+import events from "events";
+events.EventEmitter.defaultMaxListeners = 20000;
  
 const message_file_path = path.join(import.meta.url, '../assets/message.json');
 const fuse_node_path = path.join(import.meta.url, '../assets/fuse.node');
@@ -141,7 +138,8 @@ const deployTermGenerators = new Map<Deploy, TermGeneratorFunction>([
 //const fileBuff = fs.readFileSync(messageFileURL.pathname);
 //const { value } = JSON.parse(fileBuff.toString());
 
-const QueuedJobs = require("queued-jobs").default;
+import QueuedJobs from "queued-jobs";
+
 const readQueue = new QueuedJobs(40960, 999 * 60 * 1000);
 const writeQueue = new QueuedJobs(40960, 999 * 60 * 1000);
 
@@ -151,7 +149,7 @@ const maxPhloLimit = 10000000000;
 
 //Restricts the number of data chunks deployed with each deploy.
 //This is to prevent the deploy from taking too long and fit within the max deploy size.
-const maxChunks = 1024;
+const maxChunks = 2048;
 const maxReadChunks = 4096;
 
 //This parameter allocates x amount of workers per validator.
@@ -219,6 +217,7 @@ readQueue.registerHandler(async (data: ExploreDeployType, requestId: number) => 
       exploreDeployQueue.get(data.deployType).push(data);
     }
 
+    // @ts-ignore
     readQueue.once(`resolve:${requestId}`, (result) => {
       resolve(result)
     })
@@ -433,6 +432,7 @@ const exploreDeployBundler = async function(exploreDeployBundle: Map<number, Arr
         }
 
         exploreDeployBundle.delete(deployType);
+        // @ts-ignore
         readQueue.dispatchEvent(`resolve:${deployRet.data.id.toString()}`, deployRet.ret);
     }
 
@@ -1024,7 +1024,7 @@ const ops = {
           purses.forEach(async (purse: string) => {
             const purseInfo = pursesInfo[purse];
             const node = getPathNode(pathSep + boxName + pathSep + purse);
-
+            
             if (!node) {
               const fileNode = await mkFile(pathSep + boxName, purse, "");
               fileNode.isFinalized = true;
@@ -1222,7 +1222,6 @@ const ops = {
 
       const chunksToRead = [...Array(chunksLength).keys()].map(i => i + chunkStart).filter(i => i < blocks);
       const remoteChunks = chunksToRead.filter(x => !node.chunksRead.includes(x)); //Chunks that don't exist in cache yet.
-
 
       //There is no need to read from chain if we have all the chunks in memory, but we still want to continue reading ahead in reasonable amounts.
       if (remoteChunks.length == 0 && !isSpecialFile) {
@@ -1721,7 +1720,7 @@ const entryFunc = async function () {
     masterRegistryUri = data.registryUri.replace('rho:id:', '');
   }
 
-  console.info("Master Registry URI: %s", masterRegistryUri);
+  console.info("RDrive ready (with uri: " + masterRegistryUri + ")");
 
   const term = readBoxTerm({ masterRegistryUri: masterRegistryUri, boxId: defaultBoxName})
   const boxResult = await rchainToolkit.http.exploreDeploy(readOnlyArray[0], {
@@ -1852,7 +1851,7 @@ const entryFunc = async function () {
       }
       if (toProcess.has(Deploy.UPDATE_PURSE_DATA)) {
         processingLag = maxChunks - Math.round((processingLag + Math.min(maxChunks, toProcess.get(Deploy.UPDATE_PURSE_DATA).length)) / 2);
-        maxWaitTime = processingLag * (maxChunks / 8);
+        maxWaitTime = processingLag * (maxChunks / 32);
       }
       
       

@@ -1,18 +1,16 @@
 import { URL } from "url";
 
 import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
+import os from "os";
+import fs from "fs";
+import path from "path";
+import {exec} from "child_process";
+import Nanoresource from "nanoresource";
+import { beforeMount, beforeUnmount, configure, unconfigure, isConfigured } from "fuse-shared-library";
 
-const os = require('os')
-const fs = require('fs')
-const path = require('path')
-const { exec } = require('child_process')
-
-const Nanoresource = require('nanoresource')
-const { beforeMount, beforeUnmount, configure, unconfigure, isConfigured } = require('fuse-shared-library')
-
+const require2 = createRequire(import.meta.url);
 const fuseFileURL = new URL("../assets/fuse.node", import.meta.url);
-const binding = require(fuseFileURL.pathname);
+const binding = require2(fuseFileURL.pathname);
 
 const IS_OSX = os.platform() === 'darwin'
 const OSX_FOLDER_ICON = '/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericFolderIcon.icns'
